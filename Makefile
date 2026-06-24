@@ -1,6 +1,6 @@
 CC ?= cc
 PREFIX ?= /usr/local
-VERSION = 1.9.0
+VERSION = 2.1.0
 
 WARN = -Wall -Wextra -Wpedantic -Werror
 CPPFLAGS ?= -Iinclude -DKASM_INSTALL_LIB=\"$(PREFIX)/share/kasm/lib\"
@@ -71,6 +71,7 @@ dist:
 	mkdir -p dist/$(DIST_NAME)
 	cp -R src include lib examples tests bench docs .github README.md CHANGELOG.md LICENSE Makefile .gitignore dist/$(DIST_NAME)/
 	rm -rf dist/$(DIST_NAME)/tests/tmp dist/$(DIST_NAME)/tests/tmp_* dist/$(DIST_NAME)/bench/tmp
+	rm -rf dist/$(DIST_NAME)/examples/*/build
 	find dist/$(DIST_NAME) -type f \( -name '*.o' -o -name 'kasm' -o -name 'kasm.exe' \) -delete
 	tar -C dist -czf dist/$(DIST_NAME).tar.gz $(DIST_NAME)
 

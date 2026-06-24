@@ -2,6 +2,11 @@
 
 The stdlib is a set of KASM include files under `lib/kasm`. It is not libc, not ABI-stable, and not a linked runtime. Macros expand inline to ordinary Linux x86-64 syscalls.
 
+KASM v2.1 also provides a small user-facing bare Linux layer under
+`std/linux/*.asm`. See [BARE_LINUX_STDLIB.md](BARE_LINUX_STDLIB.md) for the
+`kexit`, `kwrite`, `kprint`, `kprintln`, `kread`, `kmmap`, and `kmunmap`
+helpers.
+
 ## Files
 
 - `linux/syscalls.inc`: syscall numbers and constants
@@ -11,6 +16,9 @@ The stdlib is a set of KASM include files under `lib/kasm`. It is not libc, not 
 - `linux/memory.inc`: `mmap_raw`, `mmap_anon`, `munmap`, `brk`
 - `linux/strings.inc`: placeholder constant for future string routines
 - `kasm/common.inc`: small KASM-level constants
+- `std/linux/process.asm`: `kexit`, `kexit_group`
+- `std/linux/io.asm`: `kwrite`, `kread`, `kprint`, `kprintln`
+- `std/linux/memory.asm`: `kmmap`, `kmunmap`
 
 ## Constants
 
@@ -30,3 +38,6 @@ include "linux/process.inc"
 ```
 
 KASM searches the including file directory, `-I` paths, `KASM_INCLUDE_PATH`, development stdlib paths, and installed stdlib paths.
+
+Use `--print-std-path` to print the standard include roots and `--no-std` or
+`--no-stdlib` to disable automatic bundled/installed lookup.

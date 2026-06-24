@@ -1,6 +1,6 @@
 # Roadmap
 
-KASM v1.9 keeps the small assembler identity: tiny Linux x86-64 output, no-libc programs, binary layouts, object files, project builds, debug dumps, and byte-level explainability.
+KASM v2.0 keeps the small assembler identity: tiny Linux x86-64 output, no-libc programs, binary layouts, object files, internal linking, project builds, debug dumps, and byte-level explainability.
 
 Possible future work:
 

@@ -1,4 +1,4 @@
-.TH KASM 1 "June 2026" "KASM 1.9.0" "User Commands"
+.TH KASM 1 "June 2026" "KASM 2.1.0" "User Commands"
 .SH NAME
 kasm \- tiny Linux x86-64 assembler with transparent output modes
 .SH SYNOPSIS
@@ -7,6 +7,9 @@ kasm \- tiny Linux x86-64 assembler with transparent output modes
 .PP
 .B kasm build
 [\fB--config\fR \fIFILE\fR] [\fB--verbose\fR] [\fB--no-link\fR]
+.PP
+.B kasm link
+\fIfile.o ...\fR \fB-o\fR \fIapp\fR [\fB--entry\fR \fISYMBOL\fR]
 .PP
 .B kasm inspect
 \fIfile.o\fR [\fB--symbols\fR] [\fB--sections\fR] [\fB--relocs\fR]
@@ -47,6 +50,16 @@ Assemble project object files but skip the final linker invocation.
 .TP
 .B build --dump-symbols, build --dump-sections, build --dump-relocs, build --dump-all
 Print per-source project build dumps while assembling.
+.TP
+.B build --internal-linker, build --linker internal
+Link executable projects with KASM's built-in ELF64 linker instead of external ld.
+.SS Link
+.TP
+.B link file.o... -o app
+Link ELF64 relocatable object files into a static Linux x86-64 executable with the built-in linker.
+.TP
+.B link --entry SYMBOL
+Use SYMBOL as the executable entry point. The default is _start.
 .SS Include/Preprocessor
 .TP
 .B \-I PATH
@@ -55,8 +68,14 @@ Add an include search path.
 .B --print-include-paths
 Print active include search paths and exit.
 .TP
+.B --print-std-path
+Print KASM standard include roots and exit.
+.TP
 .B --no-stdlib
 Disable bundled and installed stdlib include paths.
+.TP
+.B --no-std
+Alias for --no-stdlib.
 .SS Syscalls
 .TP
 .B --no-syscall-sugar
@@ -166,6 +185,8 @@ kasm main.asm util.asm syscalls.asm
 ld main.o util.o syscalls.o -o app
 
 kasm build --config examples/project_hello/kasm.toml --verbose
+
+kasm link main.o util.o -o app
 
 kasm inspect object.o --symbols
 

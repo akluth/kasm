@@ -1,4 +1,4 @@
-# KASM v1.9 Examples
+# KASM v2.1 Examples
 
 Build examples from the repository root unless noted.
 
@@ -23,6 +23,9 @@ Build examples from the repository root unless noted.
 | `11_read_echo.asm` | stdlib read/write macros | `printf test | ./kasm examples/11_read_echo.asm -o echo && printf test | ./echo` |
 | `read_write.asm` | direct read/write syscall sugar | `printf test | ./kasm examples/read_write.asm -o read_write && printf test | ./read_write` |
 | `project_hello/` | project build mode with two source files | `cd examples/project_hello && ../../kasm build --verbose && ./build/project_hello` |
+| `std_hello/` | v2.1 bare Linux std helpers and internal linker | `cd examples/std_hello && ../../kasm build --internal-linker && ./build/std_hello` |
+| `std_read_write/` | v2.1 `kread` and `kwrite` helpers | `cd examples/std_read_write && ../../kasm src/main.asm -o std_read_write && printf test | ./std_read_write` |
+| `std_project/` | multi-source project using v2.1 std helpers | `cd examples/std_project && ../../kasm build --internal-linker && ./build/std_project` |
 | `explain_exit.asm` | compact deluxe explain fixture | `./kasm examples/explain_exit.asm -o explain_exit --explain=deluxe` |
 | `tiny_exit.asm` | compact direct ELF exit program | `./kasm --tiny --tiny-report examples/tiny_exit.asm -o tiny_exit` |
 | `tiny_hello.asm` | compact direct ELF hello program | `./kasm --tiny --tiny-report examples/tiny_hello.asm -o tiny_hello` |

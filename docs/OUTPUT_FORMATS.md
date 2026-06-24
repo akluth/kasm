@@ -1,6 +1,6 @@
 # Output Formats
 
-KASM v1.9 supports three output families.
+KASM v2.1 supports three output families.
 
 ## `-f elf64`
 

@@ -158,6 +158,7 @@ typedef struct {
     int no_stdlib;
     int no_syscall_sugar;
     int print_include_paths;
+    int print_std_path;
     int tiny;
     int tiny_report;
     int hints;

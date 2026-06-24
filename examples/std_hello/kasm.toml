@@ -1,0 +1,9 @@
+[project]
+name = "std_hello"
+type = "executable"
+
+[build]
+sources = ["src/main.asm"]
+out_dir = "build"
+output = "std_hello"
+entry = "_start"

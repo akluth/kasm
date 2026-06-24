@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.1.0
+
+KASM v2.1 adds a tiny bare Linux standard-library-like helper layer.
+
+- Added `std/linux/process.asm`, `std/linux/io.asm`, and `std/linux/memory.asm`.
+- Added `kexit`, `kexit_group`, `kwrite`, `kread`, `kprint`, `kprintln`, `kmmap`, and `kmunmap`.
+- Added `--print-std-path` and `--no-std`.
+- Kept helpers transparent through include/macro expansion; `kprint` and `kprintln` emit visible `.rodata` labels and syscall write lines in `--dump-expanded`.
+- Added bare Linux std examples and tests for direct assembly, project builds, and the internal linker.
+- Documented that this layer is not libc and does not provide a hidden runtime.
+
+## 2.0.0
+
+KASM v2.0 adds a minimal built-in ELF64 linker for KASM-generated object files.
+
+- Added `kasm link file.o... -o app`.
+- Added `--entry SYMBOL` for internal linker entry selection.
+- Added `kasm build --internal-linker` and `kasm build --linker internal`.
+- Supported `.text`, `.rodata`, `.data`, global/local/undefined symbol resolution, and KASM-emitted relocations.
+- Added diagnostics for malformed objects, duplicate globals, undefined symbols, unsupported relocation targets, and relocation overflow.
+- Added internal linker tests and documentation.
+
 ## 1.9.0
 
 KASM v1.9 improves debuggability and introspection.

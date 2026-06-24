@@ -1,6 +1,6 @@
 # Debugging and Introspection
 
-KASM v1.9 adds stable text dumps for understanding what an assembly unit produced.
+KASM v2.0 includes stable text dumps for understanding what an assembly unit produced.
 
 ## Assembly Dumps
 
@@ -81,4 +81,4 @@ src/app.asm:9:1: error: macro argument count mismatch for 'print'
 
 ## Limits
 
-KASM v1.9 does not emit DWARF, line tables, or debugger-ready metadata. The new functionality is text introspection and ELF64 object inspection groundwork.
+KASM v2.0 does not emit DWARF, line tables, or debugger-ready metadata. The debugging functionality is text introspection and ELF64 object inspection groundwork.

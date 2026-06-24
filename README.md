@@ -76,13 +76,14 @@ make install PREFIX=/tmp/kasm-test
 /tmp/kasm-test/bin/kasm examples/03_hello_stdlib.asm -o hello_stdlib
 ```
 
-`make dist` creates `dist/kasm-1.9.0.tar.gz`.
+`make dist` creates `dist/kasm-2.1.0.tar.gz`.
 
 ## Command Line
 
 ```sh
 kasm [options] input.asm
 kasm build [--config FILE] [--verbose] [--no-link]
+kasm link file.o... -o app [--entry SYMBOL]
 kasm inspect file.o [--symbols] [--sections] [--relocs]
 ```
 
@@ -104,10 +105,30 @@ Common options:
 - `--list FILE`
 - `--dump-symbols`, `--dump-sections`, `--dump-relocs`, `--dump-all`, `--dump-ir`, `--dump-structs`, `--dump-expanded`, `--dump-tokens`
 - `--print-include-paths`
-- `--no-stdlib`
+- `--print-std-path`
+- `--no-stdlib`, `--no-std`
 - `--no-syscall-sugar`
 - `--help`
 - `--version`
+
+## Internal ELF64 Linker
+
+KASM v2.0 can link KASM-generated ELF64 object files without invoking `ld` for simple static Linux executables.
+
+```sh
+./kasm main.asm util.asm
+./kasm link main.o util.o -o app
+./app
+```
+
+Project builds can opt into it:
+
+```sh
+./kasm build --internal-linker
+./kasm build --linker internal
+```
+
+The internal linker supports `.text`, `.rodata`, `.data`, basic symbol resolution, and the relocation types emitted by KASM object output.
 
 ## Project Build Mode
 
@@ -190,6 +211,23 @@ msg_len = $ - msg
 
 Include search order is: including file directory, `-I` paths, `KASM_INCLUDE_PATH`, bundled/development stdlib paths, installed stdlib path.
 
+## Bare Linux Standard Library
+
+KASM v2.1 adds a tiny optional helper layer under `lib/kasm/std/linux`. It is not libc and does not link a runtime; helpers expand to ordinary assembly and Linux syscalls.
+
+```asm
+include "std/linux/io.asm"
+include "std/linux/process.asm"
+
+global _start
+section .text
+_start:
+    kprintln "hello from kasm std"
+    kexit 0
+```
+
+Use `--dump-expanded`, `--teach`, or explain modes to inspect the generated assembly. Use `--print-std-path` to show KASM's standard include roots. Cross-file programs should be linked with `ld` or `kasm link` when the internal linker supports the objects.
+
 ## Linux Syscall Sugar
 
 Named Linux syscall pseudo-instructions expand to the x86-64 syscall ABI register setup:
@@ -252,6 +290,8 @@ Hints cover common zeroing idioms, conservative partial-register hazards, Linux 
 - [ELF Surgeon Mode](docs/ELF_SURGEON_MODE.md)
 - [Teaching Mode Tutorial](docs/TEACHING_MODE.md)
 - [Project Build Mode](docs/PROJECTS.md)
+- [Internal ELF64 Linker](docs/LINKER.md)
+- [Bare Linux Standard Library](docs/BARE_LINUX_STDLIB.md)
 - [Debugging and Introspection](docs/DEBUGGING.md)
 - [Understanding x86-64 Encodings](docs/ENCODING_EXPLAINED.md)
 - [Tiny Mode](docs/TINY_MODE.md)

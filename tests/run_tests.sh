@@ -31,10 +31,12 @@ expect_fail() {
     pass "$name"
 }
 
-./kasm --version | grep -q "KASM 1.9.0"
+./kasm --version | grep -q "KASM 2.1.0"
 ./kasm --help | grep -q -- "--dump-symbols"
 ./kasm --help | grep -q -- "--dump-all"
 ./kasm --help | grep -q -- "kasm inspect"
+./kasm --help | grep -q -- "kasm link"
+./kasm --help | grep -q -- "--internal-linker"
 ./kasm --help | grep -q -- "elf64-obj"
 ./kasm --help | grep -q -- "--dump-expanded"
 ./kasm --help | grep -q -- "--explain=deluxe"
@@ -48,6 +50,8 @@ expect_fail() {
 ./kasm --help | grep -q -- "--hints"
 ./kasm --help | grep -q -- "--hints-cpu"
 ./kasm --help | grep -q -- "--no-syscall-sugar"
+./kasm --help | grep -q -- "--print-std-path"
+./kasm --help | grep -q -- "--no-std"
 ./kasm --help | grep -q -- "kasm build"
 ./kasm --help | grep -q -- "output:"
 ./kasm --help | grep -q -- "project build:"
@@ -57,6 +61,7 @@ expect_fail() {
 ./kasm --help | grep -q -- "debug/dump:"
 ./kasm --help | grep -q -- "general:"
 ./kasm --print-include-paths | grep -q "lib/kasm"
+./kasm --print-std-path | grep -q "lib/kasm"
 pass "help/version"
 
 ./kasm examples/hello.asm -o "$tmp/hello"
@@ -271,6 +276,7 @@ entry = "_start"
 TOML
 cat > "$tmp/project/src/main.asm" <<'ASM'
 global _start
+entry _start
 section .text
 _start:
     syscall write, STDOUT, msg, msg_len
@@ -299,6 +305,14 @@ out="$("$tmp/project/build/hello")"
 [ "$out" = "project hello" ] || fail "project executable output"
 grep -q "link:" "$tmp/project_link.out" || fail "project verbose link"
 pass "project build link"
+
+rm -rf "$tmp/project/build"
+./kasm build --config "$tmp/project/kasm.toml" --internal-linker --verbose > "$tmp/project_internal_link.out"
+[ -x "$tmp/project/build/hello" ] || fail "project internal executable missing"
+out="$("$tmp/project/build/hello")"
+[ "$out" = "project hello" ] || fail "project internal executable output"
+grep -q "link: internal" "$tmp/project_internal_link.out" || fail "project internal verbose link"
+pass "project build internal linker"
 
 ./kasm build --config "$tmp/project/kasm.toml" --no-link --dump-symbols > "$tmp/project_dump_symbols.out"
 grep -q "Symbols:" "$tmp/project_dump_symbols.out" || fail "project dump symbols header"
@@ -1134,7 +1148,7 @@ if ./kasm examples/hello.asm --explain-format json -o "$tmp/bad_explain_format" 
     fail "invalid explain format should fail"
 fi
 grep -q "unsupported explain format" "$tmp/bad_explain_format.err" || fail "invalid explain format diagnostic"
-grep -q "KASM v1.9 supports --explain-format text" "$tmp/bad_explain_format.err" || fail "invalid explain format hint"
+grep -q "KASM v2.1 supports --explain-format text" "$tmp/bad_explain_format.err" || fail "invalid explain format hint"
 pass "invalid explain format"
 
 ./kasm examples/stdlib_hello.asm -o "$tmp/stdlib_hello"
@@ -1165,6 +1179,109 @@ pass "stdlib map list"
 ./kasm examples/stdlib_hello.asm -f obj -o "$tmp/stdlib_hello.o"
 [ -s "$tmp/stdlib_hello.o" ] || fail "stdlib object"
 pass "stdlib object"
+
+cat > "$tmp/std_kexit.asm" <<'ASM'
+include "std/linux/process.asm"
+
+global _start
+entry _start
+section .text
+_start:
+    kexit 0
+ASM
+./kasm "$tmp/std_kexit.asm" -o "$tmp/std_kexit"
+"$tmp/std_kexit"
+pass "std kexit"
+
+cat > "$tmp/std_kprint.asm" <<'ASM'
+include "std/linux/io.asm"
+include "std/linux/process.asm"
+
+global _start
+entry _start
+section .text
+_start:
+    kprint "hello"
+    kexit 0
+ASM
+./kasm "$tmp/std_kprint.asm" -o "$tmp/std_kprint"
+out="$("$tmp/std_kprint")"
+[ "$out" = "hello" ] || fail "std kprint"
+./kasm "$tmp/std_kprint.asm" --dump-expanded > "$tmp/std_kprint.expanded"
+grep -q "__kasm_kprint" "$tmp/std_kprint.expanded" || fail "std kprint expanded label"
+grep -q 'db "hello"' "$tmp/std_kprint.expanded" || fail "std kprint expanded literal"
+grep -q "syscall write, STDOUT" "$tmp/std_kprint.expanded" || fail "std kprint expanded syscall"
+pass "std kprint"
+
+cat > "$tmp/std_kprintln.asm" <<'ASM'
+include "std/linux/io.asm"
+include "std/linux/process.asm"
+
+global _start
+entry _start
+section .text
+_start:
+    kprintln "hello"
+    kexit 0
+ASM
+./kasm "$tmp/std_kprintln.asm" -o "$tmp/std_kprintln"
+out="$("$tmp/std_kprintln")"
+[ "$out" = "hello" ] || fail "std kprintln"
+pass "std kprintln"
+
+cat > "$tmp/std_kwrite.asm" <<'ASM'
+include "std/linux/io.asm"
+include "std/linux/process.asm"
+
+global _start
+entry _start
+section .text
+_start:
+    kwrite STDOUT, msg, msg_len
+    kexit 0
+
+section .rodata
+msg:
+    db "kwrite"
+msg_len = $ - msg
+ASM
+./kasm "$tmp/std_kwrite.asm" -o "$tmp/std_kwrite"
+out="$("$tmp/std_kwrite")"
+[ "$out" = "kwrite" ] || fail "std kwrite"
+pass "std kwrite"
+
+cat > "$tmp/std_kread.asm" <<'ASM'
+include "std/linux/io.asm"
+include "std/linux/process.asm"
+
+global _start
+entry _start
+section .text
+_start:
+    kread STDIN, buffer, 8
+    mov r15, rax
+    kwrite STDOUT, buffer, r15
+    kexit 0
+
+section .data
+buffer:
+    resb 8
+ASM
+./kasm "$tmp/std_kread.asm" -o "$tmp/std_kread"
+out="$(printf 'read' | "$tmp/std_kread")"
+[ "$out" = "read" ] || fail "std kread"
+pass "std kread"
+
+rm -rf examples/std_hello/build examples/std_project/build
+./kasm build --config examples/std_hello/kasm.toml --internal-linker > "$tmp/std_hello_build.out"
+out="$(examples/std_hello/build/std_hello)"
+[ "$out" = "hello from kasm std" ] || fail "std hello project"
+pass "std example internal linker"
+
+./kasm build --config examples/std_project/kasm.toml --internal-linker > "$tmp/std_project_build.out"
+out="$(examples/std_project/build/std_project)"
+[ "$out" = "hello from std project" ] || fail "std project output"
+pass "std project build"
 
 cat > "$tmp/stdlib_files_memory.asm" <<'ASM'
 include "linux/files.inc"
@@ -1355,6 +1472,64 @@ ld "$tmp/object_start.o" -o "$tmp/object_start"
 out="$("$tmp/object_start")"
 [ "$out" = "Hello from KASM object" ] || fail "linked object output"
 pass "elf64 object ld"
+
+./kasm link "$tmp/object_start.o" -o "$tmp/object_start_internal"
+out="$("$tmp/object_start_internal")"
+[ "$out" = "Hello from KASM object" ] || fail "internal linked object output"
+pass "internal linker single object"
+
+mkdir -p "$tmp/internal_link"
+cat > "$tmp/internal_link/main.asm" <<'ASM'
+global _start
+extern util_exit
+section .text
+_start:
+    call util_exit
+ASM
+cat > "$tmp/internal_link/util.asm" <<'ASM'
+global util_exit
+section .text
+util_exit:
+    syscall exit, 0
+ASM
+./kasm "$tmp/internal_link/main.asm" -f obj -o "$tmp/internal_link/main.o"
+./kasm "$tmp/internal_link/util.asm" -f obj -o "$tmp/internal_link/util.o"
+./kasm link "$tmp/internal_link/main.o" "$tmp/internal_link/util.o" -o "$tmp/internal_link/app"
+"$tmp/internal_link/app"
+pass "internal linker multiple objects"
+
+cat > "$tmp/internal_link/dup_a.asm" <<'ASM'
+global dupe
+section .text
+dupe:
+    ret
+ASM
+cat > "$tmp/internal_link/dup_b.asm" <<'ASM'
+global dupe
+section .text
+dupe:
+    ret
+ASM
+./kasm "$tmp/internal_link/dup_a.asm" -f obj -o "$tmp/internal_link/dup_a.o"
+./kasm "$tmp/internal_link/dup_b.asm" -f obj -o "$tmp/internal_link/dup_b.o"
+if ./kasm link "$tmp/internal_link/dup_a.o" "$tmp/internal_link/dup_b.o" -o "$tmp/internal_link/dup" 2> "$tmp/internal_link/dup.err"; then
+    fail "internal duplicate global should fail"
+fi
+grep -q "duplicate global symbol 'dupe'" "$tmp/internal_link/dup.err" || fail "internal duplicate diagnostic"
+
+cat > "$tmp/internal_link/undef.asm" <<'ASM'
+global _start
+extern missing_target
+section .text
+_start:
+    call missing_target
+ASM
+./kasm "$tmp/internal_link/undef.asm" -f obj -o "$tmp/internal_link/undef.o"
+if ./kasm link "$tmp/internal_link/undef.o" -o "$tmp/internal_link/undef" 2> "$tmp/internal_link/undef.err"; then
+    fail "internal undefined symbol should fail"
+fi
+grep -q "undefined symbol 'missing_target'" "$tmp/internal_link/undef.err" || fail "internal undefined diagnostic"
+pass "internal linker diagnostics"
 
 ./kasm examples/07_object_ld.asm -f obj -o "$tmp/ex07.o"
 ld "$tmp/ex07.o" -o "$tmp/ex07"

@@ -418,6 +418,37 @@ static int parse_include_path(char *rest, char **out)
     return 1;
 }
 
+static int parse_kprint_literal(char *rest)
+{
+    rest = kasm_trim(rest);
+    size_t n = strlen(rest);
+    return n >= 2 && rest[0] == '"' && rest[n - 1] == '"';
+}
+
+static void expand_kprint_literal(Preproc *pp, ExpandedLines *out, const char *path,
+                                  int line, char *literal, int newline)
+{
+    char label[128];
+    snprintf(label, sizeof(label), "__kasm_%s_%d_msg",
+             newline ? "kprintln" : "kprint", pp->unique_id++);
+    char len_label[160];
+    snprintf(len_label, sizeof(len_label), "%s_len", label);
+    char buf[4096];
+    expanded_add(out, "section .rodata", path, line);
+    snprintf(buf, sizeof(buf), "%s:", label);
+    expanded_add(out, buf, path, line);
+    if (newline)
+        snprintf(buf, sizeof(buf), "    db %s, 10", literal);
+    else
+        snprintf(buf, sizeof(buf), "    db %s", literal);
+    expanded_add(out, buf, path, line);
+    snprintf(buf, sizeof(buf), "%s = $ - %s", len_label, label);
+    expanded_add(out, buf, path, line);
+    expanded_add(out, "section .text", path, line);
+    snprintf(buf, sizeof(buf), "    syscall write, STDOUT, %s, %s", label, len_label);
+    expanded_add(out, buf, path, line);
+}
+
 static void macro_free(MacroDef *m)
 {
     free(m->name);
@@ -625,7 +656,7 @@ static int expand_file(Assembler *as, Preproc *pp, const char *path, ExpandedLin
         if (!in_macro && (word[0] == '%' || strcmp(word, "bits") == 0 ||
             strcmp(word, "org") == 0 || strcmp(word, "default") == 0)) {
             kasm_error(as, (SourceLoc){ path, line_no, 1 },
-                       "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM v1.9 syntax", word);
+                       "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM v2.1 syntax", word);
             free(word);
             fclose(f);
             stack_pop(pp);
@@ -801,6 +832,21 @@ static int expand_file(Assembler *as, Preproc *pp, const char *path, ExpandedLin
             macro_line = line_no;
             in_macro = 1;
             free(name);
+            free(word);
+            continue;
+        }
+
+        if (strcmp(word, "kprint") == 0 || strcmp(word, "kprintln") == 0) {
+            if (!parse_kprint_literal(rest)) {
+                kasm_error(as, (SourceLoc){ path, line_no, 1 },
+                           "%s expects one string literal argument", word);
+                fprintf(stderr, "  hint: use %s \"text\"\n", word);
+                free(word);
+                fclose(f);
+                stack_pop(pp);
+                return 0;
+            }
+            expand_kprint_literal(pp, out, path, line_no, rest, strcmp(word, "kprintln") == 0);
             free(word);
             continue;
         }
@@ -1136,7 +1182,8 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
             kasm_error(as, (SourceLoc){ as->path, line_no, col }, "unexpected token '%s'", name);
             return 0;
         }
-        if (!kasm_eval_expr(as, expr, *current, offsets[*current], 0, &value,
+        uint64_t current_offset = *current == SEC_NONE ? 0 : offsets[*current];
+        if (!kasm_eval_expr(as, expr, *current, current_offset, 0, &value,
                             (SourceLoc){ as->path, line_no, kasm_column_of(orig, expr) }))
             return 0;
         kasm_symbol_define(as, name, SEC_NONE, 0, 1, value, line_no, col);
@@ -1144,7 +1191,7 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
         memset(&st, 0, sizeof(st));
         st.type = ST_CONST;
         st.section = *current;
-        st.offset = offsets[*current];
+        st.offset = current_offset;
         st.line = line_no;
         st.column = col;
         st.source = kasm_xstrdup(orig);
@@ -1164,7 +1211,7 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
     if (op[0] == '%' || strcmp(op, "bits") == 0 ||
         strcmp(op, "org") == 0 || strcmp(op, "default") == 0) {
         kasm_error(as, (SourceLoc){ as->path, line_no, op_col },
-                   "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM v1.9 syntax", op);
+                   "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM v2.1 syntax", op);
         free(op);
         return 0;
     }

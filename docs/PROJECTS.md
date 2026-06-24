@@ -1,6 +1,6 @@
 # Project Build Mode
 
-KASM v1.9 includes a small project build command for real multi-file examples:
+KASM v2.0 includes a small project build command for real multi-file examples:
 
 ```sh
 kasm build
@@ -8,6 +8,7 @@ kasm build --config path/to/kasm.toml
 kasm build --verbose
 kasm build --no-link
 kasm build --dump-symbols
+kasm build --internal-linker
 ```
 
 `kasm build` reads `kasm.toml` from the current directory unless `--config` is provided. The supported TOML subset is intentionally strict: section headers, quoted string values, and one-line quoted string arrays.

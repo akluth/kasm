@@ -244,9 +244,10 @@ void kasm_add_reloc(Assembler *as, SectionId section, uint64_t offset,
 
 static void usage(FILE *out)
 {
-    fprintf(out, "KASM 1.9.0\n");
+    fprintf(out, "KASM 2.1.0\n");
     fprintf(out, "usage: kasm [options] input.asm\n");
     fprintf(out, "       kasm build [--config FILE] [--verbose] [--no-link]\n");
+    fprintf(out, "       kasm link file.o... -o app [--entry SYMBOL]\n");
     fprintf(out, "       kasm inspect file.o [--symbols] [--sections] [--relocs]\n\n");
     fprintf(out, "output:\n");
     fprintf(out, "  -o FILE           write output file\n");
@@ -259,10 +260,17 @@ static void usage(FILE *out)
     fprintf(out, "  build --config F  use a specific project config\n");
     fprintf(out, "  build --verbose   print assemble/link commands\n");
     fprintf(out, "  build --no-link   assemble project objects only\n");
+    fprintf(out, "  build --internal-linker  link executable projects with KASM linker\n");
+    fprintf(out, "  build --linker internal  same as --internal-linker\n");
+    fprintf(out, "\nlink:\n");
+    fprintf(out, "  link file.o... -o app  link ELF64 objects with built-in linker\n");
+    fprintf(out, "  link --entry S         use entry symbol S, default _start\n");
     fprintf(out, "\ninclude/preprocessor:\n");
     fprintf(out, "  -I PATH           add include search path\n");
     fprintf(out, "  --print-include-paths  print include search paths\n");
+    fprintf(out, "  --print-std-path  print KASM standard include roots\n");
     fprintf(out, "  --no-stdlib       disable bundled include search paths\n");
+    fprintf(out, "  --no-std          alias for --no-stdlib\n");
     fprintf(out, "\nsyscalls:\n");
     fprintf(out, "  --no-syscall-sugar  reject named syscall pseudo-instructions\n");
     fprintf(out, "\nexplain/list/map:\n");
@@ -387,6 +395,7 @@ static void write_map_file(Assembler *as, const char *format);
 static void print_elf_info(Assembler *as, const char *output, const char *format);
 static void print_teaching_mode(Assembler *as, const char *output, const char *format);
 static int run_inspect(int argc, char **argv);
+static int run_link_command(int argc, char **argv);
 
 static void add_input(char ***items, size_t *len, size_t *cap, const char *path)
 {
@@ -459,6 +468,7 @@ static void copy_assembler_options(Assembler *dst, const Assembler *src)
     dst->no_stdlib = src->no_stdlib;
     dst->no_syscall_sugar = src->no_syscall_sugar;
     dst->print_include_paths = src->print_include_paths;
+    dst->print_std_path = src->print_std_path;
     dst->tiny = src->tiny;
     dst->tiny_report = src->tiny_report;
     dst->hints = src->hints;
@@ -1552,6 +1562,17 @@ typedef struct {
 } InspectEhdr;
 
 typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} InspectPhdr;
+
+typedef struct {
     uint32_t sh_name;
     uint32_t sh_type;
     uint64_t sh_flags;
@@ -1617,6 +1638,8 @@ static const char *inspect_reloc_type(uint32_t type)
 {
     if (type == 1) return "R_X86_64_64";
     if (type == 2) return "R_X86_64_PC32";
+    if (type == 10) return "R_X86_64_32";
+    if (type == 11) return "R_X86_64_32S";
     return "R_X86_64_UNKNOWN";
 }
 
@@ -1633,6 +1656,31 @@ static int read_exact(FILE *f, uint64_t off, void *buf, size_t n)
     if (fseek(f, (long)off, SEEK_SET) != 0)
         return 0;
     return fread(buf, 1, n, f) == n;
+}
+
+static int link_write_pad(FILE *f, uint64_t at, uint64_t target)
+{
+    static const unsigned char zero[4096] = { 0 };
+    while (at < target) {
+        uint64_t n = target - at;
+        if (n > sizeof(zero))
+            n = sizeof(zero);
+        if (fwrite(zero, 1, (size_t)n, f) != n)
+            return 0;
+        at += n;
+    }
+    return 1;
+}
+
+static int link_write_section(FILE *f, uint64_t *pos, uint64_t off, ByteBuf *sec)
+{
+    if (!link_write_pad(f, *pos, off))
+        return 0;
+    *pos = off;
+    if (sec->len && fwrite(sec->data, 1, sec->len, f) != sec->len)
+        return 0;
+    *pos += sec->len;
+    return 1;
 }
 
 static int run_inspect(int argc, char **argv)
@@ -1804,6 +1852,568 @@ static int run_inspect(int argc, char **argv)
     return 0;
 }
 
+typedef struct {
+    char *name;
+    uint64_t value;
+    const char *path;
+} LinkSymbol;
+
+typedef struct {
+    LinkSymbol *items;
+    size_t len;
+    size_t cap;
+} LinkSymbolTable;
+
+typedef struct {
+    char *path;
+    InspectShdr *sh;
+    uint16_t shnum;
+    char *shstr;
+    size_t shstr_len;
+    InspectSym *symtab;
+    size_t sym_count;
+    char *strtab;
+    size_t strtab_len;
+    ByteBuf section_data[SEC_COUNT];
+    uint64_t input_size[SEC_COUNT];
+    uint64_t output_off[SEC_COUNT];
+    uint16_t obj_sec_index[SEC_COUNT];
+} LinkObject;
+
+static void link_symbol_table_free(LinkSymbolTable *tab)
+{
+    for (size_t i = 0; i < tab->len; i++)
+        free(tab->items[i].name);
+    free(tab->items);
+}
+
+static LinkSymbol *link_symbol_find(LinkSymbolTable *tab, const char *name)
+{
+    for (size_t i = 0; i < tab->len; i++)
+        if (strcmp(tab->items[i].name, name) == 0)
+            return &tab->items[i];
+    return NULL;
+}
+
+static int link_symbol_add(LinkSymbolTable *tab, const char *name, uint64_t value,
+                           const char *path)
+{
+    if (!name || !*name)
+        return 1;
+    LinkSymbol *old = link_symbol_find(tab, name);
+    if (old) {
+        fprintf(stderr, "%s: error: duplicate global symbol '%s'\n", path, name);
+        fprintf(stderr, "hint: keep one global definition and mark other references extern\n");
+        return 0;
+    }
+    if (tab->len == tab->cap) {
+        tab->cap = tab->cap ? tab->cap * 2 : 64;
+        tab->items = kasm_xrealloc(tab->items, tab->cap * sizeof(LinkSymbol));
+    }
+    tab->items[tab->len].name = kasm_xstrdup(name);
+    tab->items[tab->len].value = value;
+    tab->items[tab->len].path = path;
+    tab->len++;
+    return 1;
+}
+
+static void link_object_free(LinkObject *obj)
+{
+    free(obj->path);
+    free(obj->sh);
+    free(obj->shstr);
+    free(obj->symtab);
+    free(obj->strtab);
+    for (int i = 0; i < SEC_COUNT; i++)
+        free(obj->section_data[i].data);
+}
+
+static SectionId link_section_id(const char *name)
+{
+    if (strcmp(name, ".text") == 0) return SEC_TEXT;
+    if (strcmp(name, ".rodata") == 0) return SEC_RODATA;
+    if (strcmp(name, ".data") == 0 || strcmp(name, ".bss") == 0) return SEC_DATA;
+    return SEC_NONE;
+}
+
+static int load_link_object(const char *path, LinkObject *obj)
+{
+    memset(obj, 0, sizeof(*obj));
+    obj->path = kasm_xstrdup(path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "%s: error: cannot read object file\n", path);
+        return 0;
+    }
+    InspectEhdr eh;
+    if (fread(&eh, 1, sizeof(eh), f) != sizeof(eh) ||
+        eh.e_ident[0] != 0x7f || eh.e_ident[1] != 'E' ||
+        eh.e_ident[2] != 'L' || eh.e_ident[3] != 'F' ||
+        eh.e_ident[4] != 2 || eh.e_ident[5] != 1 || eh.e_type != 1) {
+        fclose(f);
+        fprintf(stderr, "%s: error: malformed input object: expected ELF64 relocatable\n", path);
+        return 0;
+    }
+    if (!eh.e_shoff || !eh.e_shnum || eh.e_shentsize != sizeof(InspectShdr)) {
+        fclose(f);
+        fprintf(stderr, "%s: error: malformed input object: invalid section table\n", path);
+        return 0;
+    }
+    obj->shnum = eh.e_shnum;
+    obj->sh = kasm_xrealloc(NULL, (size_t)obj->shnum * sizeof(InspectShdr));
+    if (!read_exact(f, eh.e_shoff, obj->sh, (size_t)obj->shnum * sizeof(InspectShdr))) {
+        fclose(f);
+        fprintf(stderr, "%s: error: malformed input object: cannot read section table\n", path);
+        return 0;
+    }
+    if (eh.e_shstrndx >= obj->shnum) {
+        fclose(f);
+        fprintf(stderr, "%s: error: malformed input object: invalid section name table\n", path);
+        return 0;
+    }
+    obj->shstr_len = (size_t)obj->sh[eh.e_shstrndx].sh_size;
+    obj->shstr = kasm_xrealloc(NULL, obj->shstr_len ? obj->shstr_len : 1);
+    if (obj->shstr_len &&
+        !read_exact(f, obj->sh[eh.e_shstrndx].sh_offset, obj->shstr, obj->shstr_len)) {
+        fclose(f);
+        fprintf(stderr, "%s: error: malformed input object: cannot read section names\n", path);
+        return 0;
+    }
+    for (uint16_t i = 1; i < obj->shnum; i++) {
+        const char *name = inspect_section_name(obj->shstr, obj->shstr_len, obj->sh[i].sh_name);
+        SectionId sec = link_section_id(name);
+        if (sec != SEC_NONE && strncmp(name, ".rela", 5) != 0) {
+            obj->obj_sec_index[sec] = i;
+            obj->input_size[sec] = obj->sh[i].sh_size;
+            if (obj->sh[i].sh_type == 1 && obj->sh[i].sh_size) {
+                obj->section_data[sec].data = kasm_xrealloc(NULL, (size_t)obj->sh[i].sh_size);
+                obj->section_data[sec].len = (size_t)obj->sh[i].sh_size;
+                obj->section_data[sec].cap = (size_t)obj->sh[i].sh_size;
+                if (!read_exact(f, obj->sh[i].sh_offset, obj->section_data[sec].data,
+                                (size_t)obj->sh[i].sh_size)) {
+                    fclose(f);
+                    fprintf(stderr, "%s: error: malformed input object: cannot read section %s\n", path, name);
+                    return 0;
+                }
+            } else if (obj->sh[i].sh_type != 8 && obj->sh[i].sh_size) {
+                fclose(f);
+                fprintf(stderr, "%s: error: malformed input object: unsupported section type for %s\n", path, name);
+                return 0;
+            }
+        } else if (strcmp(name, ".symtab") == 0 && obj->sh[i].sh_type == 2 &&
+                   obj->sh[i].sh_entsize == sizeof(InspectSym)) {
+            obj->sym_count = (size_t)(obj->sh[i].sh_size / obj->sh[i].sh_entsize);
+            obj->symtab = kasm_xrealloc(NULL, obj->sym_count * sizeof(InspectSym));
+            if (!read_exact(f, obj->sh[i].sh_offset, obj->symtab,
+                            obj->sym_count * sizeof(InspectSym))) {
+                fclose(f);
+                fprintf(stderr, "%s: error: malformed input object: cannot read symbol table\n", path);
+                return 0;
+            }
+            if (obj->sh[i].sh_link < obj->shnum) {
+                obj->strtab_len = (size_t)obj->sh[obj->sh[i].sh_link].sh_size;
+                obj->strtab = kasm_xrealloc(NULL, obj->strtab_len ? obj->strtab_len : 1);
+                if (obj->strtab_len &&
+                    !read_exact(f, obj->sh[obj->sh[i].sh_link].sh_offset, obj->strtab, obj->strtab_len)) {
+                    fclose(f);
+                    fprintf(stderr, "%s: error: malformed input object: cannot read string table\n", path);
+                    return 0;
+                }
+            }
+        }
+    }
+    fclose(f);
+    if (!obj->symtab || !obj->strtab) {
+        fprintf(stderr, "%s: error: malformed input object: missing symbol table\n", path);
+        return 0;
+    }
+    return 1;
+}
+
+static uint64_t link_section_vaddr(SectionId sec, uint64_t text_vaddr,
+                                   uint64_t ro_vaddr, uint64_t data_vaddr)
+{
+    if (sec == SEC_TEXT) return text_vaddr;
+    if (sec == SEC_RODATA) return ro_vaddr;
+    if (sec == SEC_DATA) return data_vaddr;
+    return 0;
+}
+
+static int link_sym_value(LinkObject *objects, size_t obj_count, LinkSymbolTable *globals,
+                          LinkObject *obj, uint32_t sym_index, uint64_t text_vaddr,
+                          uint64_t ro_vaddr, uint64_t data_vaddr, uint64_t *out)
+{
+    if (sym_index >= obj->sym_count) {
+        fprintf(stderr, "%s: error: relocation references invalid symbol index %u\n",
+                obj->path, sym_index);
+        return 0;
+    }
+    InspectSym *s = &obj->symtab[sym_index];
+    const char *name = inspect_symbol_name(obj->strtab, obj->strtab_len, s->st_name);
+    if (s->st_shndx == 0) {
+        LinkSymbol *g = link_symbol_find(globals, name);
+        if (!g) {
+            fprintf(stderr, "%s: error: undefined symbol '%s'\n", obj->path, name);
+            fprintf(stderr, "hint: provide an object file that defines '%s'\n", name);
+            return 0;
+        }
+        *out = g->value;
+        return 1;
+    }
+    if (s->st_shndx == 0xfff1) {
+        *out = s->st_value;
+        return 1;
+    }
+    for (size_t oi = 0; oi < obj_count; oi++) {
+        LinkObject *candidate = &objects[oi];
+        if (candidate != obj)
+            continue;
+        for (int sec = 0; sec < SEC_COUNT; sec++) {
+            if (candidate->obj_sec_index[sec] == s->st_shndx) {
+                *out = link_section_vaddr((SectionId)sec, text_vaddr, ro_vaddr, data_vaddr) +
+                       candidate->output_off[sec] + s->st_value;
+                return 1;
+            }
+        }
+    }
+    fprintf(stderr, "%s: error: symbol '%s' references unsupported section index %u\n",
+            obj->path, name, s->st_shndx);
+    return 0;
+}
+
+static void write_u32_at(ByteBuf *buf, uint64_t off, uint32_t v)
+{
+    memcpy(buf->data + off, &v, 4);
+}
+
+static void write_u64_at(ByteBuf *buf, uint64_t off, uint64_t v)
+{
+    memcpy(buf->data + off, &v, 8);
+}
+
+static int apply_link_relocations(LinkObject *objects, size_t obj_count,
+                                  LinkSymbolTable *globals, ByteBuf merged[SEC_COUNT],
+                                  uint64_t text_vaddr, uint64_t ro_vaddr, uint64_t data_vaddr)
+{
+    for (size_t oi = 0; oi < obj_count; oi++) {
+        LinkObject *obj = &objects[oi];
+        for (uint16_t si = 1; si < obj->shnum; si++) {
+            if (obj->sh[si].sh_type != 4 || obj->sh[si].sh_entsize != sizeof(InspectRela))
+                continue;
+            if (obj->sh[si].sh_info >= obj->shnum) {
+                fprintf(stderr, "%s: error: malformed relocation section index %u\n",
+                        obj->path, obj->sh[si].sh_info);
+                return 0;
+            }
+            SectionId target_sec = SEC_NONE;
+            for (int sec = 0; sec < SEC_COUNT; sec++)
+                if (obj->obj_sec_index[sec] == obj->sh[si].sh_info)
+                    target_sec = (SectionId)sec;
+            if (target_sec == SEC_NONE) {
+                const char *sec_name = inspect_section_name(obj->shstr, obj->shstr_len, obj->sh[si].sh_name);
+                fprintf(stderr, "%s: error: unsupported relocation target section for %s\n", obj->path, sec_name);
+                return 0;
+            }
+            size_t count = (size_t)(obj->sh[si].sh_size / obj->sh[si].sh_entsize);
+            InspectRela *rela = kasm_xrealloc(NULL, count * sizeof(InspectRela));
+            FILE *f = fopen(obj->path, "rb");
+            if (!f || !read_exact(f, obj->sh[si].sh_offset, rela, count * sizeof(InspectRela))) {
+                if (f) fclose(f);
+                free(rela);
+                fprintf(stderr, "%s: error: cannot read relocation section\n", obj->path);
+                return 0;
+            }
+            fclose(f);
+            for (size_t ri = 0; ri < count; ri++) {
+                uint32_t sym_index = (uint32_t)(rela[ri].r_info >> 32);
+                uint32_t type = (uint32_t)(rela[ri].r_info & 0xffffffffu);
+                uint64_t sym_value = 0;
+                if (!link_sym_value(objects, obj_count, globals, obj, sym_index,
+                                    text_vaddr, ro_vaddr, data_vaddr, &sym_value)) {
+                    free(rela);
+                    return 0;
+                }
+                uint64_t place_off = obj->output_off[target_sec] + rela[ri].r_offset;
+                uint64_t place_addr = link_section_vaddr(target_sec, text_vaddr, ro_vaddr, data_vaddr) + place_off;
+                const char *target_name = inspect_section_name(obj->shstr, obj->shstr_len,
+                                                               obj->sh[obj->sh[si].sh_info].sh_name);
+                if (type == 1) {
+                    if (place_off + 8 > merged[target_sec].len) {
+                        fprintf(stderr, "%s: error: relocation offset 0x%llx outside section %s\n",
+                                obj->path, (unsigned long long)rela[ri].r_offset, target_name);
+                        free(rela);
+                        return 0;
+                    }
+                    write_u64_at(&merged[target_sec], place_off, sym_value + (uint64_t)rela[ri].r_addend);
+                } else if (type == 2 || type == 10 || type == 11) {
+                    int64_t value = (int64_t)sym_value + rela[ri].r_addend;
+                    if (type == 2)
+                        value -= (int64_t)place_addr;
+                    if (place_off + 4 > merged[target_sec].len) {
+                        fprintf(stderr, "%s: error: relocation offset 0x%llx outside section %s\n",
+                                obj->path, (unsigned long long)rela[ri].r_offset, target_name);
+                        free(rela);
+                        return 0;
+                    }
+                    if (type == 2 || type == 11) {
+                        if (value < INT32_MIN || value > INT32_MAX) {
+                            fprintf(stderr, "%s: error: relocation overflow at %s+0x%llx type=%s\n",
+                                    obj->path, target_name, (unsigned long long)rela[ri].r_offset,
+                                    inspect_reloc_type(type));
+                            free(rela);
+                            return 0;
+                        }
+                    } else if (value < 0 || value > UINT32_MAX) {
+                        fprintf(stderr, "%s: error: relocation overflow at %s+0x%llx type=%s\n",
+                                obj->path, target_name, (unsigned long long)rela[ri].r_offset,
+                                inspect_reloc_type(type));
+                        free(rela);
+                        return 0;
+                    }
+                    write_u32_at(&merged[target_sec], place_off, (uint32_t)(int32_t)value);
+                } else {
+                    fprintf(stderr, "%s: error: unsupported relocation type %u at %s+0x%llx\n",
+                            obj->path, type, target_name, (unsigned long long)rela[ri].r_offset);
+                    fprintf(stderr, "hint: KASM internal linker supports R_X86_64_64, R_X86_64_PC32, R_X86_64_32, and R_X86_64_32S\n");
+                    free(rela);
+                    return 0;
+                }
+            }
+            free(rela);
+        }
+    }
+    return 1;
+}
+
+static int write_linked_executable(const char *output, ByteBuf merged[SEC_COUNT],
+                                   uint64_t entry_addr)
+{
+    uint64_t base = 0x400000;
+    uint64_t phoff = 64;
+    uint16_t phnum = 3;
+    uint64_t file_align = 0x1000;
+    uint64_t text_off = kasm_align(64 + (uint64_t)phnum * 56, file_align);
+    uint64_t ro_off = kasm_align(text_off + merged[SEC_TEXT].len, file_align);
+    uint64_t data_off = kasm_align(ro_off + merged[SEC_RODATA].len, file_align);
+    uint64_t text_vaddr = base + text_off;
+    uint64_t ro_vaddr = base + ro_off;
+    uint64_t data_vaddr = base + data_off;
+    (void)text_vaddr;
+    (void)ro_vaddr;
+    (void)data_vaddr;
+
+    InspectEhdr eh;
+    memset(&eh, 0, sizeof(eh));
+    eh.e_ident[0] = 0x7f;
+    eh.e_ident[1] = 'E';
+    eh.e_ident[2] = 'L';
+    eh.e_ident[3] = 'F';
+    eh.e_ident[4] = 2;
+    eh.e_ident[5] = 1;
+    eh.e_ident[6] = 1;
+    eh.e_type = 2;
+    eh.e_machine = 62;
+    eh.e_version = 1;
+    eh.e_entry = entry_addr;
+    eh.e_phoff = phoff;
+    eh.e_ehsize = 64;
+    eh.e_phentsize = 56;
+    eh.e_phnum = phnum;
+
+    InspectPhdr ph[3];
+    memset(ph, 0, sizeof(ph));
+    ph[0].p_type = 1;
+    ph[0].p_flags = 5;
+    ph[0].p_offset = text_off;
+    ph[0].p_vaddr = text_vaddr;
+    ph[0].p_paddr = text_vaddr;
+    ph[0].p_filesz = merged[SEC_TEXT].len;
+    ph[0].p_memsz = merged[SEC_TEXT].len;
+    ph[0].p_align = file_align;
+
+    ph[1].p_type = 1;
+    ph[1].p_flags = 4;
+    ph[1].p_offset = ro_off;
+    ph[1].p_vaddr = ro_vaddr;
+    ph[1].p_paddr = ro_vaddr;
+    ph[1].p_filesz = merged[SEC_RODATA].len;
+    ph[1].p_memsz = merged[SEC_RODATA].len;
+    ph[1].p_align = file_align;
+
+    ph[2].p_type = 1;
+    ph[2].p_flags = 6;
+    ph[2].p_offset = data_off;
+    ph[2].p_vaddr = data_vaddr;
+    ph[2].p_paddr = data_vaddr;
+    ph[2].p_filesz = merged[SEC_DATA].len;
+    ph[2].p_memsz = merged[SEC_DATA].len;
+    ph[2].p_align = file_align;
+
+    FILE *f = fopen(output, "wb");
+    if (!f) {
+        fprintf(stderr, "%s: error: cannot write linked executable\n", output);
+        return 0;
+    }
+    uint64_t pos = 0;
+    if (fwrite(&eh, 1, sizeof(eh), f) != sizeof(eh) ||
+        fwrite(ph, 1, (size_t)phnum * 56, f) != (size_t)phnum * 56) {
+        fclose(f);
+        fprintf(stderr, "%s: error: cannot write linked executable\n", output);
+        return 0;
+    }
+    pos = sizeof(eh) + (uint64_t)phnum * 56;
+    if (!link_write_section(f, &pos, text_off, &merged[SEC_TEXT]) ||
+        !link_write_section(f, &pos, ro_off, &merged[SEC_RODATA]) ||
+        !link_write_section(f, &pos, data_off, &merged[SEC_DATA])) {
+        fclose(f);
+        fprintf(stderr, "%s: error: cannot write linked executable\n", output);
+        return 0;
+    }
+    fclose(f);
+#ifndef _WIN32
+    chmod(output, 0755);
+#endif
+    return 1;
+}
+
+static int kasm_internal_link(const char **inputs, size_t input_count,
+                              const char *output, const char *entry)
+{
+    if (!input_count) {
+        fprintf(stderr, "error: no object files to link\n");
+        return 2;
+    }
+    LinkObject *objects = kasm_xrealloc(NULL, input_count * sizeof(LinkObject));
+    memset(objects, 0, input_count * sizeof(LinkObject));
+    ByteBuf merged[SEC_COUNT];
+    memset(merged, 0, sizeof(merged));
+    LinkSymbolTable globals = { 0 };
+    int ok = 1;
+    for (size_t i = 0; i < input_count; i++) {
+        if (!load_link_object(inputs[i], &objects[i])) {
+            ok = 0;
+            goto done;
+        }
+        for (int sec = 0; sec < SEC_COUNT; sec++) {
+            objects[i].output_off[sec] = merged[sec].len;
+            if (objects[i].section_data[sec].len) {
+                kasm_buf_append(&merged[sec], objects[i].section_data[sec].data,
+                                objects[i].section_data[sec].len);
+            } else if (objects[i].input_size[sec]) {
+                for (uint64_t z = 0; z < objects[i].input_size[sec]; z++)
+                    kasm_buf_append_u8(&merged[sec], 0);
+            }
+        }
+    }
+
+    uint64_t base = 0x400000;
+    uint16_t phnum = 3;
+    uint64_t file_align = 0x1000;
+    uint64_t text_off = kasm_align(64 + (uint64_t)phnum * 56, file_align);
+    uint64_t ro_off = kasm_align(text_off + merged[SEC_TEXT].len, file_align);
+    uint64_t data_off = kasm_align(ro_off + merged[SEC_RODATA].len, file_align);
+    uint64_t text_vaddr = base + text_off;
+    uint64_t ro_vaddr = base + ro_off;
+    uint64_t data_vaddr = base + data_off;
+
+    for (size_t oi = 0; oi < input_count; oi++) {
+        LinkObject *obj = &objects[oi];
+        for (size_t si = 0; si < obj->sym_count; si++) {
+            InspectSym *s = &obj->symtab[si];
+            if ((s->st_info >> 4) != 1 || s->st_shndx == 0)
+                continue;
+            const char *name = inspect_symbol_name(obj->strtab, obj->strtab_len, s->st_name);
+            uint64_t value = 0;
+            if (s->st_shndx == 0xfff1) {
+                value = s->st_value;
+            } else {
+                SectionId sec = SEC_NONE;
+                for (int k = 0; k < SEC_COUNT; k++)
+                    if (obj->obj_sec_index[k] == s->st_shndx)
+                        sec = (SectionId)k;
+                if (sec == SEC_NONE) {
+                    fprintf(stderr, "%s: error: global symbol '%s' is in unsupported section index %u\n",
+                            obj->path, name, s->st_shndx);
+                    ok = 0;
+                    goto done;
+                }
+                value = link_section_vaddr(sec, text_vaddr, ro_vaddr, data_vaddr) +
+                        obj->output_off[sec] + s->st_value;
+            }
+            if (!link_symbol_add(&globals, name, value, obj->path)) {
+                ok = 0;
+                goto done;
+            }
+        }
+    }
+
+    if (!apply_link_relocations(objects, input_count, &globals, merged,
+                                text_vaddr, ro_vaddr, data_vaddr)) {
+        ok = 0;
+        goto done;
+    }
+    LinkSymbol *entry_sym = link_symbol_find(&globals, entry ? entry : "_start");
+    if (!entry_sym) {
+        fprintf(stderr, "error: undefined entry symbol '%s'\n", entry ? entry : "_start");
+        fprintf(stderr, "hint: define the entry symbol or pass --entry SYMBOL\n");
+        ok = 0;
+        goto done;
+    }
+    ok = write_linked_executable(output, merged, entry_sym->value);
+
+done:
+    for (size_t i = 0; i < input_count; i++)
+        link_object_free(&objects[i]);
+    free(objects);
+    for (int sec = 0; sec < SEC_COUNT; sec++)
+        free(merged[sec].data);
+    link_symbol_table_free(&globals);
+    return ok ? 0 : 1;
+}
+
+static int run_link_command(int argc, char **argv)
+{
+    const char *output = NULL;
+    const char *entry = "_start";
+    const char **inputs = NULL;
+    size_t input_count = 0, input_cap = 0;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: option '-o' requires an argument\n");
+                free(inputs);
+                return 2;
+            }
+            output = argv[++i];
+        } else if (strcmp(argv[i], "--entry") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: option '--entry' requires an argument\n");
+                free(inputs);
+                return 2;
+            }
+            entry = argv[++i];
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "error: unknown link option '%s'\n", argv[i]);
+            free(inputs);
+            return 2;
+        } else {
+            if (input_count == input_cap) {
+                input_cap = input_cap ? input_cap * 2 : 8;
+                inputs = kasm_xrealloc(inputs, input_cap * sizeof(char *));
+            }
+            inputs[input_count++] = argv[i];
+        }
+    }
+    if (!output) {
+        fprintf(stderr, "error: link requires -o output\n");
+        free(inputs);
+        return 2;
+    }
+    int rc = kasm_internal_link(inputs, input_count, output, entry);
+    free(inputs);
+    return rc;
+}
+
 static int run_project_build(const char *argv0, int argc, char **argv)
 {
     const char *config_path = "kasm.toml";
@@ -1813,6 +2423,8 @@ static int run_project_build(const char *argv0, int argc, char **argv)
     int dump_sections_flag = 0;
     int dump_relocs_flag = 0;
     int dump_all_flag = 0;
+    int internal_linker = 0;
+    const char *linker_override = NULL;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0) {
             if (i + 1 >= argc) {
@@ -1824,6 +2436,19 @@ static int run_project_build(const char *argv0, int argc, char **argv)
             verbose = 1;
         } else if (strcmp(argv[i], "--no-link") == 0) {
             no_link = 1;
+        } else if (strcmp(argv[i], "--internal-linker") == 0) {
+            internal_linker = 1;
+        } else if (strcmp(argv[i], "--linker") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: option '--linker' requires an argument\n");
+                return 2;
+            }
+            const char *linker_arg = argv[++i];
+            if (strcmp(linker_arg, "internal") == 0) {
+                internal_linker = 1;
+            } else {
+                linker_override = linker_arg;
+            }
         } else if (strcmp(argv[i], "--dump-symbols") == 0) {
             dump_symbols_flag = 1;
         } else if (strcmp(argv[i], "--dump-sections") == 0) {
@@ -1845,6 +2470,10 @@ static int run_project_build(const char *argv0, int argc, char **argv)
     if (!parse_project_config(config_path, &cfg)) {
         project_config_free(&cfg);
         return 2;
+    }
+    if (linker_override) {
+        free(cfg.linker);
+        cfg.linker = kasm_xstrdup(linker_override);
     }
     char *config_dir = path_dirname_dup(config_path);
     char *out_dir = path_join_dup(config_dir, cfg.out_dir);
@@ -1913,7 +2542,19 @@ static int run_project_build(const char *argv0, int argc, char **argv)
             break;
     }
 
-    if (!status && !no_link) {
+    if (!status && !no_link && internal_linker) {
+        char *exe = path_join_dup(out_dir, cfg.output);
+        if (verbose)
+            printf("link: internal");
+        if (verbose) {
+            for (size_t i = 0; i < cfg.source_count; i++)
+                printf(" %s", objects[i]);
+            printf(" -o %s --entry %s\n", exe, cfg.entry);
+        }
+        if (kasm_internal_link((const char **)objects, cfg.source_count, exe, cfg.entry) != 0)
+            status = 1;
+        free(exe);
+    } else if (!status && !no_link) {
         char *exe = path_join_dup(out_dir, cfg.output);
         size_t cmd_len = 0, cmd_cap = 0;
         char *cmd = NULL;
@@ -1960,6 +2601,8 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "build") == 0)
         return run_project_build(argv[0], argc, argv);
+    if (argc > 1 && strcmp(argv[1], "link") == 0)
+        return run_link_command(argc, argv);
     if (argc > 1 && strcmp(argv[1], "inspect") == 0)
         return run_inspect(argc, argv);
 
@@ -2017,7 +2660,7 @@ int main(int argc, char **argv)
             const char *fmt = argv[++i];
             if (strcmp(fmt, "text") != 0) {
                 fprintf(stderr, "error: unsupported explain format '%s'\n", fmt);
-                fprintf(stderr, "hint: KASM v1.9 supports --explain-format text\n");
+                fprintf(stderr, "hint: KASM v2.1 supports --explain-format text\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--explain-file") == 0) {
@@ -2053,7 +2696,10 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--print-include-paths") == 0) {
             as.print_include_paths = 1;
-        } else if (strcmp(argv[i], "--no-stdlib") == 0) {
+        } else if (strcmp(argv[i], "--print-std-path") == 0) {
+            as.print_std_path = 1;
+        } else if (strcmp(argv[i], "--no-stdlib") == 0 ||
+                   strcmp(argv[i], "--no-std") == 0) {
             as.no_stdlib = 1;
         } else if (strcmp(argv[i], "--no-syscall-sugar") == 0) {
             as.no_syscall_sugar = 1;
@@ -2101,7 +2747,7 @@ int main(int argc, char **argv)
                 return 2;
             }
         } else if (strcmp(argv[i], "--version") == 0) {
-            puts("KASM 1.9.0");
+            puts("KASM 2.1.0");
             return 0;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(stdout);
@@ -2166,6 +2812,13 @@ int main(int argc, char **argv)
     if (as.print_include_paths) {
         for (size_t pi = 0; pi < as.include_path_count; pi++)
             printf("%s\n", as.include_paths[pi]);
+        free(inputs);
+        kasm_assembler_free(&as);
+        return 0;
+    }
+    if (as.print_std_path) {
+        puts("lib/kasm");
+        puts(KASM_INSTALL_LIB);
         free(inputs);
         kasm_assembler_free(&as);
         return 0;
