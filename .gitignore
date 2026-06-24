@@ -1,0 +1,16 @@
+kasm
+kasm.exe
+src/*.o
+hello
+exit
+sugar
+explain
+out.bin
+*.o
+object_start
+main_puts
+tests_obj
+tests_*
+tests/tmp/
+bench/tmp/
+dist/

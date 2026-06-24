@@ -1,0 +1,213 @@
+.TH KASM 1 "June 2026" "KASM 1.9.0" "User Commands"
+.SH NAME
+kasm \- tiny Linux x86-64 assembler with transparent output modes
+.SH SYNOPSIS
+.B kasm
+[\fIoptions\fR] \fIinput.asm\fR
+.PP
+.B kasm build
+[\fB--config\fR \fIFILE\fR] [\fB--verbose\fR] [\fB--no-link\fR]
+.PP
+.B kasm inspect
+\fIfile.o\fR [\fB--symbols\fR] [\fB--sections\fR] [\fB--relocs\fR]
+.SH DESCRIPTION
+KASM is a small C11 assembler for Linux x86-64 with Intel-like syntax. It focuses on direct ELF64 output, no-libc programs, binary layout work, and educational byte-level transparency through explain, map, and listing modes.
+.PP
+KASM is intentionally not a complete NASM replacement.
+.SH OPTIONS
+.SS Output
+.TP
+.B \-o FILE
+Write output to FILE.
+.TP
+.B \-f FORMAT
+Select output format. Supported values are elf64, elf64-obj, obj, and bin. The default is elf64.
+.TP
+.B --combine
+Recognized but not implemented yet. Multiple inputs currently assemble independently to .o files and should be linked with ld.
+.TP
+.B --tiny, -Oz
+Prefer smaller safe encodings and compact direct ELF layout.
+.TP
+.B --tiny-report
+Enable tiny mode and print jump, immediate, savings, and final-size statistics.
+.SS Project Build
+.TP
+.B build
+Build the project described by kasm.toml in the current directory.
+.TP
+.B build --config FILE
+Use a specific project configuration file.
+.TP
+.B build --verbose
+Print every assemble step and the exact linker command.
+.TP
+.B build --no-link
+Assemble project object files but skip the final linker invocation.
+.TP
+.B build --dump-symbols, build --dump-sections, build --dump-relocs, build --dump-all
+Print per-source project build dumps while assembling.
+.SS Include/Preprocessor
+.TP
+.B \-I PATH
+Add an include search path.
+.TP
+.B --print-include-paths
+Print active include search paths and exit.
+.TP
+.B --no-stdlib
+Disable bundled and installed stdlib include paths.
+.SS Syscalls
+.TP
+.B --no-syscall-sugar
+Reject named syscall pseudo-instructions such as syscall write, STDOUT, msg, len. Plain raw syscall with no operands remains supported.
+.SS Explain/List/Map
+.TP
+.B --explain
+Print byte listing and encoding explanations.
+.TP
+.B --explain=normal
+Print normal explain output.
+.TP
+.B --explain=verbose
+Print verbose byte-level explain output with REX/opcode/ModRM/SIB details where available.
+.TP
+.B --explain=deluxe
+Print structured encoding explanations with source location, normalized form, virtual address, length, prefixes, opcode, ModRM/SIB, displacement, immediate, relocation, and notes.
+.TP
+.B --explain-format text
+Select text explain output. Text is the only supported explain format.
+.TP
+.B --explain-file FILE
+Write explain output to FILE.
+.TP
+.B --elf-info
+Print a generated ELF64 anatomy summary with header, program headers, sections, symbols, relocations, and entry point explanation.
+.TP
+.B --teach
+Print a guided assembly, syscall ABI, encoding, and ELF walkthrough.
+.TP
+.B --teach-level LEVEL
+Select teaching detail level. LEVEL may be beginner, intermediate, or deep.
+.TP
+.B --map FILE
+Write a map file with sections, symbols, relocations, and structs.
+.TP
+.B --list FILE
+Write a compact listing file.
+.SS Hints
+.TP
+.B --hints
+Print non-fatal educational performance and ABI hints.
+.TP
+.B --hints=LIST
+Enable selected hint categories. LIST is comma-separated and may contain perf, abi, size, or all.
+.TP
+.B --hints-cpu CPU
+Select hint CPU profile: generic, intel, amd, zen4, or skylake.
+.SS Debug/Dump
+.TP
+.B --dump-symbols
+Print parsed symbols.
+.TP
+.B --dump-sections
+Print section sizes and flags.
+.TP
+.B --dump-ir
+Print parsed intermediate statements.
+.TP
+.B --dump-relocs
+Print relocation entries.
+.TP
+.B --dump-all
+Print symbols, sections, and relocations in one stable report.
+.TP
+.B --dump-structs
+Print struct layouts.
+.TP
+.B --dump-expanded
+Print source after includes and macro expansion.
+.TP
+.B --dump-tokens
+Print expanded source lines for token debugging.
+.SS General
+.TP
+.B --help
+Show help.
+.TP
+.B --version
+Show version.
+.SH OUTPUT FORMATS
+.TP
+.B elf64
+Direct Linux x86-64 executable. Requires an entry symbol and cannot resolve externals.
+.TP
+.B elf64-obj
+ELF64 relocatable object.
+.TP
+.B obj
+Alias for elf64-obj.
+.TP
+.B bin
+Raw section bytes in .text, .rodata, .data order.
+.SH SYNTAX OVERVIEW
+KASM supports semicolon comments, section declarations, labels, entry, global, extern, constants, simple expressions, data directives, memory operands, size specifiers, includes, defines, macros, macro-local labels, structs, sizeof, offsetof, syscall sugar, and stdlib includes.
+.PP
+See docs/SYNTAX.md, docs/INSTRUCTIONS.md, docs/SYSCALL_SUGAR.md, and docs/ELF_SURGEON_MODE.md for syntax, instruction subset, syscall sugar, and ELF anatomy output.
+.SH EXAMPLES
+.EX
+kasm examples/01_hello_raw_syscall.asm -o hello
+./hello
+
+kasm examples/07_object_ld.asm -f obj -o object.o
+ld object.o -o object
+
+kasm main.asm util.asm syscalls.asm
+ld main.o util.o syscalls.o -o app
+
+kasm build --config examples/project_hello/kasm.toml --verbose
+
+kasm inspect object.o --symbols
+
+kasm examples/09_struct_binary_header.asm -f bin -o header.bin
+
+kasm examples/10_explain_demo.asm -o demo --explain=deluxe --map demo.map --list demo.lst
+
+kasm --elf-info examples/hello.asm -o hello
+
+kasm --teach examples/teach_hello.asm -o teach_hello
+
+kasm --tiny --tiny-report examples/tiny_exit.asm -o tiny_exit
+
+kasm examples/hints.asm -o hints --hints
+
+kasm examples/syscall_sugar_hello.asm -o sugar && ./sugar
+.EE
+.SH FILES
+.TP
+.I /usr/local/share/kasm/lib
+Default installed stdlib include tree.
+.TP
+.I lib/kasm
+Development stdlib include tree.
+.SH ENVIRONMENT
+.TP
+.B KASM_INCLUDE_PATH
+Colon-separated include search paths. These are searched after \-I paths and before bundled or installed stdlib paths.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Assembly or source error.
+.TP
+.B 2
+CLI usage error.
+.TP
+.B 3
+File/system error, reserved for future finer-grained handling.
+.SH LIMITATIONS
+KASM is Linux x86-64 only. It has a limited instruction subset, limited relocation types, no dynamic linker generation for direct executable mode, no debug info/DWARF, no full expression language, no full C preprocessor, and no libc. The inline stdlib is macro/include-based and does not handle syscall errors automatically.
+.SH PROJECT
+KASM is a focused educational assembler for small binaries and byte-level transparency.

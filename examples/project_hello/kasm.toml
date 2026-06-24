@@ -1,0 +1,10 @@
+[project]
+name = "project_hello"
+type = "executable"
+
+[build]
+sources = ["src/main.asm", "src/data.asm"]
+out_dir = "build"
+output = "project_hello"
+linker = "ld"
+entry = "_start"
