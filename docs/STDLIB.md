@@ -2,7 +2,7 @@
 
 The stdlib is a set of KASM include files under `lib/kasm`. It is not libc, not ABI-stable, and not a linked runtime. Macros expand inline to ordinary Linux x86-64 syscalls.
 
-KASM v2.1 also provides a small user-facing bare Linux layer under
+KASM also provides a small user-facing bare Linux layer under
 `std/linux/*.asm`. See [BARE_LINUX_STDLIB.md](BARE_LINUX_STDLIB.md) for the
 `kexit`, `kwrite`, `kprint`, `kprintln`, `kread`, `kmmap`, and `kmunmap`
 helpers.

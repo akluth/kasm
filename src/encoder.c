@@ -255,14 +255,29 @@ static int scale_bits(int scale)
     return 3;
 }
 
-static int emit_modrm_mem(ByteBuf *out, int reg_field, const MemOp *mem)
+static int mem_disp_size(const MemOp *mem, int tiny)
+{
+    if (mem->rip_relative)
+        return 4;
+    if (!tiny)
+        return 4;
+    if (mem->disp == 0 && (mem->base & 7) != 5)
+        return 0;
+    if (is_i8(mem->disp))
+        return 1;
+    return 4;
+}
+
+static int emit_modrm_mem(ByteBuf *out, int reg_field, const MemOp *mem, int tiny)
 {
     if (mem->rip_relative) {
         modrm(out, 0, reg_field, 5);
         return 0;
     }
     int need_sib = mem->has_index || (mem->base & 7) == 4;
-    modrm(out, 2, reg_field, need_sib ? 4 : mem->base);
+    int disp_size = mem_disp_size(mem, tiny);
+    int mod = disp_size == 0 ? 0 : disp_size == 1 ? 1 : 2;
+    modrm(out, mod, reg_field, need_sib ? 4 : mem->base);
     if (need_sib) {
         int idx = mem->has_index ? mem->index : 4;
         kasm_buf_append_u8(out, (uint8_t)((scale_bits(mem->scale) << 6) |
@@ -286,16 +301,59 @@ static int rex_size(int w, int r, int x, int b)
     return v != 0x40;
 }
 
-static int mem_encoding_size(int reg_bits, int reg, const MemOp *mem)
+static int mem_encoding_size(int reg_bits, int reg, const MemOp *mem, int tiny)
 {
     return rex_size(reg_bits == 64, reg, mem->has_index ? mem->index : 0,
                     mem->rip_relative ? 0 : mem->base) +
-           1 + 1 + (mem_uses_sib(mem) ? 1 : 0) + 4;
+           1 + 1 + (mem_uses_sib(mem) ? 1 : 0) + mem_disp_size(mem, tiny);
 }
 
 static void append_disp32(ByteBuf *out, int64_t disp)
 {
     kasm_buf_append_u32(out, (uint32_t)(int32_t)disp);
+}
+
+static void append_mem_disp(ByteBuf *out, const MemOp *mem, int tiny)
+{
+    int disp_size = mem_disp_size(mem, tiny);
+    if (disp_size == 1)
+        kasm_buf_append_u8(out, (uint8_t)(int8_t)mem->disp);
+    else if (disp_size == 4)
+        append_disp32(out, mem->rip_relative ? 0 : mem->disp);
+}
+
+static const char *mem_encoding_why(Assembler *as, const MemOp *mem, const char *normal)
+{
+    static char buf[160];
+    int disp_size = mem_disp_size(mem, as->tiny);
+    if (as->tiny && !mem->rip_relative && disp_size < 4) {
+        snprintf(buf, sizeof(buf), "tiny: %s with %s displacement",
+                 normal, disp_size == 0 ? "no" : "disp8");
+        return buf;
+    }
+    return normal;
+}
+
+static void count_tiny_mem_disp(Assembler *as, const MemOp *mem)
+{
+    if (!as->tiny || mem->rip_relative)
+        return;
+    int disp_size = mem_disp_size(mem, 1);
+    if (disp_size == 0)
+        as->tiny_disp0_used++;
+    else if (disp_size == 1)
+        as->tiny_disp8_used++;
+}
+
+static uint8_t accumulator_imm_opcode(const char *name)
+{
+    if (strcmp(name, "add") == 0) return 0x05;
+    if (strcmp(name, "or") == 0) return 0x0D;
+    if (strcmp(name, "and") == 0) return 0x25;
+    if (strcmp(name, "sub") == 0) return 0x2D;
+    if (strcmp(name, "xor") == 0) return 0x35;
+    if (strcmp(name, "cmp") == 0) return 0x3D;
+    return 0;
 }
 
 static int emit_reg_mem_common(Assembler *as, Statement *st, ByteBuf *out,
@@ -309,8 +367,8 @@ static int emit_reg_mem_common(Assembler *as, Statement *st, ByteBuf *out,
     rex(out, reg_bits == 64, reg, mem->has_index ? mem->index : 0,
         mem->rip_relative ? 0 : mem->base);
     kasm_buf_append_u8(out, opcode);
-    emit_modrm_mem(out, reg, mem);
-    append_disp32(out, mem->rip_relative ? 0 : mem->disp);
+    emit_modrm_mem(out, reg, mem, as->tiny);
+    append_mem_disp(out, mem, as->tiny);
     if (mem->rip_relative) {
         if (as->object_mode) {
             kasm_add_reloc(as, st->section, out->len - 4, mem->symbol, RELOC_PC32, -4,
@@ -351,9 +409,9 @@ static int emit_binop(Assembler *as, Statement *st, ByteBuf *out, const char **w
         }
         rex(out, bbits == 64, b, mem.has_index ? mem.index : 0, mem.rip_relative ? 0 : mem.base);
         kasm_buf_append_u8(out, rm_reg_op);
-        emit_modrm_mem(out, b, &mem);
-        append_disp32(out, mem.rip_relative ? 0 : mem.disp);
-        *why = "ModRM/SIB memory operand";
+        emit_modrm_mem(out, b, &mem, as->tiny);
+        append_mem_disp(out, &mem, as->tiny);
+        *why = mem_encoding_why(as, &mem, "ModRM/SIB memory operand");
         return 1;
     }
     if (!reg_code(st->operands[0].text, &a, &abits)) {
@@ -365,7 +423,7 @@ static int emit_binop(Assembler *as, Statement *st, ByteBuf *out, const char **w
     if (op1_mem) {
         if (!emit_reg_mem_common(as, st, out, 1, a, abits, &mem, reg_rm_op, "mem"))
             return 0;
-        *why = "ModRM/SIB memory operand";
+        *why = mem_encoding_why(as, &mem, "ModRM/SIB memory operand");
         return 1;
     }
     if (reg_code(st->operands[1].text, &b, &bbits)) {
@@ -384,12 +442,27 @@ static int emit_binop(Assembler *as, Statement *st, ByteBuf *out, const char **w
         kasm_error(as, loc1, "integer literal out of range '%s'", st->operands[1].text);
         return 0;
     }
-    rex(out, abits == 64, 0, 0, a);
     if (as->tiny && is_i8(imm)) {
+        rex(out, abits == 64, 0, 0, a);
         kasm_buf_append_u8(out, 0x83);
         modrm(out, 3, imm_ext, a);
         kasm_buf_append_u8(out, (uint8_t)(int8_t)imm);
+        static char buf[128];
+        snprintf(buf, sizeof(buf), "tiny: selected sign-extended imm8 for %s", name);
+        *why = buf;
+        return 1;
+    }
+    uint8_t acc_op = accumulator_imm_opcode(name);
+    if (as->tiny && acc_op && (a & 7) == 0 && (abits == 32 || abits == 64)) {
+        rex(out, abits == 64, 0, 0, a);
+        kasm_buf_append_u8(out, acc_op);
+        kasm_buf_append_u32(out, (uint32_t)imm);
+        static char buf[128];
+        snprintf(buf, sizeof(buf), "tiny: selected accumulator imm32 form for %s", name);
+        *why = buf;
+        return 1;
     } else {
+        rex(out, abits == 64, 0, 0, a);
         kasm_buf_append_u8(out, imm_group);
         modrm(out, 3, imm_ext, a);
         kasm_buf_append_u32(out, (uint32_t)imm);
@@ -485,7 +558,7 @@ static int is_branch_op(const char *op)
 }
 
 static int tiny_binop_size(Assembler *as, Statement *st, const char *name,
-                           int allow_imm8, int *used_imm8)
+                           int allow_imm8, int *used_imm8, int count_stats)
 {
     int a, b, abits, bbits;
     MemOp mem;
@@ -497,15 +570,20 @@ static int tiny_binop_size(Assembler *as, Statement *st, const char *name,
     if (op0_mem) {
         if (!reg_code(st->operands[1].text, &b, &bbits))
             return st->size ? (int)st->size : 15;
-        return mem_encoding_size(bbits, b, &mem);
+        if (count_stats)
+            count_tiny_mem_disp(as, &mem);
+        return mem_encoding_size(bbits, b, &mem, as->tiny);
     }
     if (!reg_code(st->operands[0].text, &a, &abits))
         return st->size ? (int)st->size : 15;
     int op1_mem = parse_mem_operand(as, st->operands[1].text, loc1, &mem);
     if (op1_mem < 0)
         return st->size ? (int)st->size : 15;
-    if (op1_mem)
-        return mem_encoding_size(abits, a, &mem);
+    if (op1_mem) {
+        if (count_stats)
+            count_tiny_mem_disp(as, &mem);
+        return mem_encoding_size(abits, a, &mem, as->tiny);
+    }
     if (reg_code(st->operands[1].text, &b, &bbits))
         return rex_size(abits == 64 || bbits == 64, b, 0, a) + 2;
     int64_t imm;
@@ -514,6 +592,12 @@ static int tiny_binop_size(Assembler *as, Statement *st, const char *name,
     if (allow_imm8 && is_i8(imm)) {
         *used_imm8 = 1;
         return rex_size(abits == 64, 0, 0, a) + 3;
+    }
+    if (as->tiny && accumulator_imm_opcode(name) && (a & 7) == 0 &&
+        (abits == 32 || abits == 64)) {
+        if (used_imm8)
+            *used_imm8 = 2;
+        return rex_size(abits == 64, 0, 0, a) + 5;
     }
     (void)name;
     return rex_size(abits == 64, 0, 0, a) + 6;
@@ -530,8 +614,14 @@ static int tiny_instr_size(Assembler *as, Statement *st, int count_stats)
     if (strcmp(op, "syscall") == 0 && c == 0) return 2;
     if (strcmp(op, "ret") == 0 && c == 0) return 1;
     if ((strcmp(op, "push") == 0 || strcmp(op, "pop") == 0) && c == 1) {
-        if (strcmp(op, "push") == 0 && !reg_code(st->operands[0].text, &rd, &b1))
-            return 5;
+        if (strcmp(op, "push") == 0 && !reg_code(st->operands[0].text, &rd, &b1)) {
+            int64_t imm;
+            if (!kasm_eval_expr(as, st->operands[0].text, st->section, st->offset, 0, &imm, loc0))
+                return st->size ? (int)st->size : 15;
+            if (count_stats && as->tiny && is_i8(imm))
+                as->tiny_push_imm8_used++;
+            return as->tiny && is_i8(imm) ? 2 : 5;
+        }
         if (!reg_code(st->operands[0].text, &rd, &b1))
             return st->size ? (int)st->size : 15;
         return rex_size(0, 0, 0, rd) + 1;
@@ -549,15 +639,20 @@ static int tiny_instr_size(Assembler *as, Statement *st, int count_stats)
         if (dst_mem) {
             if (!reg_code(st->operands[1].text, &rs, &b2))
                 return st->size ? (int)st->size : 15;
-            return mem_encoding_size(b2, rs, &mem);
+            if (count_stats)
+                count_tiny_mem_disp(as, &mem);
+            return mem_encoding_size(b2, rs, &mem, as->tiny);
         }
         if (!reg_code(st->operands[0].text, &rd, &b1))
             return st->size ? (int)st->size : 15;
         int src_mem = parse_mem_operand(as, st->operands[1].text, loc1, &mem);
         if (src_mem < 0)
             return st->size ? (int)st->size : 15;
-        if (src_mem)
-            return mem_encoding_size(b1, rd, &mem);
+        if (src_mem) {
+            if (count_stats)
+                count_tiny_mem_disp(as, &mem);
+            return mem_encoding_size(b1, rd, &mem, as->tiny);
+        }
         if (reg_code(st->operands[1].text, &rs, &b2))
             return rex_size(b1 == 64 || b2 == 64, rs, 0, rd) + 2;
         int64_t imm;
@@ -580,20 +675,22 @@ static int tiny_instr_size(Assembler *as, Statement *st, int count_stats)
         int pm = parse_mem_operand(as, st->operands[1].text, loc1, &mem);
         if (pm <= 0)
             return st->size ? (int)st->size : 15;
-        return mem_encoding_size(64, rd, &mem);
+        if (count_stats)
+            count_tiny_mem_disp(as, &mem);
+        return mem_encoding_size(64, rd, &mem, as->tiny);
     }
     if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 ||
          strcmp(op, "and") == 0 || strcmp(op, "or") == 0 ||
          strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0) && c == 2) {
         int used_imm8 = 0;
-        int sz = tiny_binop_size(as, st, op, 1, &used_imm8);
+        int sz = tiny_binop_size(as, st, op, 1, &used_imm8, count_stats);
         if (count_stats && used_imm8)
-            as->tiny_imm8_used++;
+            (used_imm8 == 2 ? as->tiny_accumulator_used++ : as->tiny_imm8_used++);
         return sz;
     }
     if (strcmp(op, "test") == 0 && c == 2) {
         int used_imm8 = 0;
-        return tiny_binop_size(as, st, op, 0, &used_imm8);
+        return tiny_binop_size(as, st, op, 0, &used_imm8, count_stats);
     }
     if (strcmp(op, "call") == 0 && c == 1)
         return 5;
@@ -672,6 +769,10 @@ int kasm_apply_tiny_layout(Assembler *as)
     as->tiny_jumps_shortened = 0;
     as->tiny_near_jumps = 0;
     as->tiny_imm8_used = 0;
+    as->tiny_push_imm8_used = 0;
+    as->tiny_accumulator_used = 0;
+    as->tiny_disp8_used = 0;
+    as->tiny_disp0_used = 0;
     as->tiny_bytes_saved = 0;
     for (size_t i = 0; i < as->program.len; i++) {
         Statement *st = &as->program.items[i];
@@ -810,6 +911,12 @@ static int emit_instr(Assembler *as, Statement *st, ByteBuf *out, const char **w
                 kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "integer literal out of range");
                 return 0;
             }
+            if (as->tiny && is_i8(imm)) {
+                kasm_buf_append_u8(out, 0x6A);
+                kasm_buf_append_u8(out, (uint8_t)(int8_t)imm);
+                *why = "tiny: selected push imm8";
+                return 1;
+            }
             kasm_buf_append_u8(out, 0x68);
             kasm_buf_append_u32(out, (uint32_t)imm);
             *why = "push imm32";
@@ -858,7 +965,7 @@ static int emit_instr(Assembler *as, Statement *st, ByteBuf *out, const char **w
             }
             if (!emit_reg_mem_common(as, st, out, 0, rs, b2, &mem, 0x89, "mem"))
                 return 0;
-            *why = "mov qword ptr [mem], r64; ModRM/SIB memory operand";
+            *why = mem_encoding_why(as, &mem, "mov qword ptr [mem], r64; ModRM/SIB memory operand");
             return 1;
         }
         if (!reg_code(st->operands[0].text, &rd, &b1)) {
@@ -871,7 +978,7 @@ static int emit_instr(Assembler *as, Statement *st, ByteBuf *out, const char **w
         if (src_mem) {
             if (!emit_reg_mem_common(as, st, out, 1, rd, b1, &mem, 0x8B, "mem"))
                 return 0;
-            *why = "mov r64, qword ptr [mem]; ModRM/SIB memory operand";
+            *why = mem_encoding_why(as, &mem, "mov r64, qword ptr [mem]; ModRM/SIB memory operand");
             return 1;
         }
         if (reg_code(st->operands[1].text, &rs, &b2)) {
@@ -974,7 +1081,7 @@ static int emit_instr(Assembler *as, Statement *st, ByteBuf *out, const char **w
         if (pm <= 0) return 0;
         rex(out, 1, rd, mem.has_index ? mem.index : 0, mem.rip_relative ? 0 : mem.base);
         kasm_buf_append_u8(out, 0x8D);
-        emit_modrm_mem(out, rd, &mem);
+        emit_modrm_mem(out, rd, &mem, as->tiny);
         if (mem.rip_relative) {
             if (as->object_mode) {
                 kasm_add_reloc(as, st->section, out->len, mem.symbol, RELOC_PC32, -4,
@@ -989,9 +1096,10 @@ static int emit_instr(Assembler *as, Statement *st, ByteBuf *out, const char **w
                 kasm_buf_append_u32(out, (uint32_t)(int32_t)(target - here));
             }
         } else {
-            append_disp32(out, mem.disp);
+            append_mem_disp(out, &mem, as->tiny);
         }
-        *why = mem.rip_relative ? "RIP-relative LEA" : "lea r64, [mem]; ModRM/SIB memory operand";
+        *why = mem.rip_relative ? "RIP-relative LEA" :
+               mem_encoding_why(as, &mem, "lea r64, [mem]; ModRM/SIB memory operand");
         return 1;
     }
     if (strcmp(op, "jmp") == 0 || strcmp(op, "call") == 0 ||
@@ -1021,7 +1129,11 @@ static int emit_instr(Assembler *as, Statement *st, ByteBuf *out, const char **w
             int64_t disp = (int64_t)target_off - (int64_t)(st->offset + 2);
             kasm_buf_append_u8(out, strcmp(op, "jmp") == 0 ? 0xEB : jcc_short_opcode(op));
             kasm_buf_append_u8(out, (uint8_t)(int8_t)disp);
-            *why = strcmp(op, "jmp") == 0 ? "jmp rel8" : "jcc rel8";
+            static char buf[160];
+            snprintf(buf, sizeof(buf), "tiny: selected short %s because target distance is %lld bytes",
+                     strcmp(op, "jmp") == 0 ? "jump" : "conditional jump",
+                     (long long)disp);
+            *why = buf;
             return 1;
         }
         int sz = is_jcc ? 6 : 5;

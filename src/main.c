@@ -244,16 +244,18 @@ void kasm_add_reloc(Assembler *as, SectionId section, uint64_t offset,
 
 static void usage(FILE *out)
 {
-    fprintf(out, "KASM 2.1.0\n");
+    fprintf(out, "KASM 0.1.0\n");
     fprintf(out, "usage: kasm [options] input.asm\n");
     fprintf(out, "       kasm build [--config FILE] [--verbose] [--no-link]\n");
     fprintf(out, "       kasm link file.o... -o app [--entry SYMBOL]\n");
-    fprintf(out, "       kasm inspect file.o [--symbols] [--sections] [--relocs]\n\n");
+    fprintf(out, "       kasm inspect [--headers] [--segments] [--sections] [--symbols] [--relocs] file\n");
+    fprintf(out, "       kasm disasm [--section NAME] [--start ADDR] [--length N] file\n\n");
     fprintf(out, "output:\n");
     fprintf(out, "  -o FILE           write output file\n");
     fprintf(out, "  -f elf64|elf64-obj|obj|bin  output format, default elf64\n");
     fprintf(out, "  --combine         reserved for future multi-file combining\n");
     fprintf(out, "  --tiny, -Oz       prefer smaller safe encodings\n");
+    fprintf(out, "  --no-tiny         disable tiny mode after an earlier --tiny/-Oz\n");
     fprintf(out, "  --tiny-report     print tiny mode optimization report\n");
     fprintf(out, "\nproject build:\n");
     fprintf(out, "  build             build project described by kasm.toml\n");
@@ -265,6 +267,9 @@ static void usage(FILE *out)
     fprintf(out, "\nlink:\n");
     fprintf(out, "  link file.o... -o app  link ELF64 objects with built-in linker\n");
     fprintf(out, "  link --entry S         use entry symbol S, default _start\n");
+    fprintf(out, "\nbinary tools:\n");
+    fprintf(out, "  inspect FILE      inspect ELF64 headers, segments, sections, symbols, relocations\n");
+    fprintf(out, "  disasm FILE       disassemble supported x86-64 encodings from ELF .text\n");
     fprintf(out, "\ninclude/preprocessor:\n");
     fprintf(out, "  -I PATH           add include search path\n");
     fprintf(out, "  --print-include-paths  print include search paths\n");
@@ -395,6 +400,7 @@ static void write_map_file(Assembler *as, const char *format);
 static void print_elf_info(Assembler *as, const char *output, const char *format);
 static void print_teaching_mode(Assembler *as, const char *output, const char *format);
 static int run_inspect(int argc, char **argv);
+static int run_disasm(int argc, char **argv);
 static int run_link_command(int argc, char **argv);
 
 static void add_input(char ***items, size_t *len, size_t *cap, const char *path)
@@ -573,6 +579,10 @@ static void print_tiny_report(Assembler *as)
     puts("Tiny mode report:");
     printf("- jumps shortened: %llu\n", (unsigned long long)as->tiny_jumps_shortened);
     printf("- imm8 encodings used: %llu\n", (unsigned long long)as->tiny_imm8_used);
+    printf("- push imm8 encodings used: %llu\n", (unsigned long long)as->tiny_push_imm8_used);
+    printf("- accumulator encodings used: %llu\n", (unsigned long long)as->tiny_accumulator_used);
+    printf("- disp8 memory encodings used: %llu\n", (unsigned long long)as->tiny_disp8_used);
+    printf("- zero-displacement memory encodings used: %llu\n", (unsigned long long)as->tiny_disp0_used);
     printf("- near jumps required: %llu\n", (unsigned long long)as->tiny_near_jumps);
     printf("- estimated bytes saved: %llu\n", (unsigned long long)as->tiny_bytes_saved);
     printf("- final output size: %llu bytes\n", (unsigned long long)as->tiny_final_size);
@@ -1658,6 +1668,47 @@ static int read_exact(FILE *f, uint64_t off, void *buf, size_t n)
     return fread(buf, 1, n, f) == n;
 }
 
+static int range_ok(uint64_t off, uint64_t size, size_t file_size)
+{
+    return off <= (uint64_t)file_size && size <= (uint64_t)file_size - off;
+}
+
+static int read_file_image(const char *path, unsigned char **out, size_t *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "error: cannot read file '%s'\n", path);
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        fprintf(stderr, "error: cannot seek file '%s'\n", path);
+        return 0;
+    }
+    long n = ftell(f);
+    if (n < 0) {
+        fclose(f);
+        fprintf(stderr, "error: cannot size file '%s'\n", path);
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        fprintf(stderr, "error: cannot rewind file '%s'\n", path);
+        return 0;
+    }
+    unsigned char *buf = kasm_xrealloc(NULL, (size_t)n ? (size_t)n : 1);
+    if ((size_t)n && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        fclose(f);
+        fprintf(stderr, "error: cannot read file '%s'\n", path);
+        return 0;
+    }
+    fclose(f);
+    *out = buf;
+    *out_len = (size_t)n;
+    return 1;
+}
+
 static int link_write_pad(FILE *f, uint64_t at, uint64_t target)
 {
     static const unsigned char zero[4096] = { 0 };
@@ -1683,172 +1734,665 @@ static int link_write_section(FILE *f, uint64_t *pos, uint64_t off, ByteBuf *sec
     return 1;
 }
 
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    InspectEhdr eh;
+    InspectPhdr *ph;
+    InspectShdr *sh;
+    const char *shstr;
+    size_t shstr_len;
+} ElfImage;
+
+static const char *elf_type_name(uint16_t type)
+{
+    if (type == 1) return "REL";
+    if (type == 2) return "EXEC";
+    if (type == 3) return "DYN";
+    return "OTHER";
+}
+
+static const char *ph_type_name(uint32_t type)
+{
+    if (type == 1) return "LOAD";
+    if (type == 2) return "DYNAMIC";
+    if (type == 3) return "INTERP";
+    if (type == 4) return "NOTE";
+    if (type == 6) return "PHDR";
+    return "OTHER";
+}
+
+static const char *sh_type_name(uint32_t type)
+{
+    if (type == 0) return "NULL";
+    if (type == 1) return "PROGBITS";
+    if (type == 2) return "SYMTAB";
+    if (type == 3) return "STRTAB";
+    if (type == 4) return "RELA";
+    if (type == 8) return "NOBITS";
+    if (type == 9) return "REL";
+    if (type == 11) return "DYNSYM";
+    return "OTHER";
+}
+
+static void ph_flags(uint32_t flags, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "%s%s%s",
+             (flags & 4) ? "R" : "-",
+             (flags & 2) ? "W" : "-",
+             (flags & 1) ? "X" : "-");
+}
+
+static int load_elf_image(const char *path, ElfImage *elf)
+{
+    memset(elf, 0, sizeof(*elf));
+    if (!read_file_image(path, &elf->buf, &elf->len))
+        return 0;
+    if (elf->len < sizeof(InspectEhdr)) {
+        fprintf(stderr, "error: unsupported file type: file is too small for ELF64\n");
+        return 0;
+    }
+    memcpy(&elf->eh, elf->buf, sizeof(elf->eh));
+    if (elf->eh.e_ident[0] != 0x7f || elf->eh.e_ident[1] != 'E' ||
+        elf->eh.e_ident[2] != 'L' || elf->eh.e_ident[3] != 'F') {
+        fprintf(stderr, "error: unsupported file type: not an ELF file\n");
+        return 0;
+    }
+    if (elf->eh.e_ident[4] != 2) {
+        fprintf(stderr, "error: unsupported ELF class: expected ELF64\n");
+        return 0;
+    }
+    if (elf->eh.e_ident[5] != 1) {
+        fprintf(stderr, "error: unsupported ELF endianness: expected little-endian\n");
+        return 0;
+    }
+    if (elf->eh.e_ehsize && elf->eh.e_ehsize != sizeof(InspectEhdr)) {
+        fprintf(stderr, "error: malformed ELF header size\n");
+        return 0;
+    }
+    if (elf->eh.e_phnum) {
+        if (elf->eh.e_phentsize != sizeof(InspectPhdr) ||
+            !range_ok(elf->eh.e_phoff, (uint64_t)elf->eh.e_phnum * sizeof(InspectPhdr), elf->len)) {
+            fprintf(stderr, "error: malformed ELF program header table\n");
+            return 0;
+        }
+        elf->ph = kasm_xrealloc(NULL, (size_t)elf->eh.e_phnum * sizeof(InspectPhdr));
+        memcpy(elf->ph, elf->buf + elf->eh.e_phoff, (size_t)elf->eh.e_phnum * sizeof(InspectPhdr));
+    }
+    if (elf->eh.e_shnum) {
+        if (elf->eh.e_shentsize != sizeof(InspectShdr) ||
+            !range_ok(elf->eh.e_shoff, (uint64_t)elf->eh.e_shnum * sizeof(InspectShdr), elf->len)) {
+            fprintf(stderr, "error: malformed ELF section header table\n");
+            return 0;
+        }
+        elf->sh = kasm_xrealloc(NULL, (size_t)elf->eh.e_shnum * sizeof(InspectShdr));
+        memcpy(elf->sh, elf->buf + elf->eh.e_shoff, (size_t)elf->eh.e_shnum * sizeof(InspectShdr));
+        if (elf->eh.e_shstrndx < elf->eh.e_shnum &&
+            range_ok(elf->sh[elf->eh.e_shstrndx].sh_offset, elf->sh[elf->eh.e_shstrndx].sh_size, elf->len)) {
+            elf->shstr = (const char *)(elf->buf + elf->sh[elf->eh.e_shstrndx].sh_offset);
+            elf->shstr_len = (size_t)elf->sh[elf->eh.e_shstrndx].sh_size;
+        }
+    }
+    return 1;
+}
+
+static void free_elf_image(ElfImage *elf)
+{
+    free(elf->buf);
+    free(elf->ph);
+    free(elf->sh);
+}
+
+static void inspect_print_headers(ElfImage *elf)
+{
+    puts("ELF Header:");
+    printf("class\tELF64\n");
+    printf("endianness\tlittle\n");
+    printf("type\t%s (%u)\n", elf_type_name(elf->eh.e_type), elf->eh.e_type);
+    printf("machine\t%s (%u)\n", elf->eh.e_machine == 62 ? "x86-64" : "other", elf->eh.e_machine);
+    printf("entry\t0x%llx\n", (unsigned long long)elf->eh.e_entry);
+    printf("program_header_offset\t0x%llx\n", (unsigned long long)elf->eh.e_phoff);
+    printf("section_header_offset\t0x%llx\n", (unsigned long long)elf->eh.e_shoff);
+}
+
+static void inspect_print_segments(ElfImage *elf)
+{
+    puts("Program Headers:");
+    puts("type\tflags\tvaddr\tfile_offset\tfile_size\tmem_size\talignment");
+    for (uint16_t i = 0; i < elf->eh.e_phnum; i++) {
+        char flags[4];
+        ph_flags(elf->ph[i].p_flags, flags, sizeof(flags));
+        printf("%s\t%s\t0x%llx\t0x%llx\t%llu\t%llu\t%llu\n",
+               ph_type_name(elf->ph[i].p_type), flags,
+               (unsigned long long)elf->ph[i].p_vaddr,
+               (unsigned long long)elf->ph[i].p_offset,
+               (unsigned long long)elf->ph[i].p_filesz,
+               (unsigned long long)elf->ph[i].p_memsz,
+               (unsigned long long)elf->ph[i].p_align);
+    }
+}
+
+static void inspect_print_sections(ElfImage *elf)
+{
+    puts("Sections:");
+    puts("name\ttype\tflags\taddress\tfile_offset\tsize\talignment");
+    if (!elf->sh) return;
+    for (uint16_t i = 1; i < elf->eh.e_shnum; i++) {
+        char flags[4];
+        inspect_flags(elf->sh[i].sh_flags, flags, sizeof(flags));
+        printf("%s\t%s\t%s\t0x%llx\t0x%llx\t%llu\t%llu\n",
+               inspect_section_name(elf->shstr, elf->shstr_len, elf->sh[i].sh_name),
+               sh_type_name(elf->sh[i].sh_type), flags,
+               (unsigned long long)elf->sh[i].sh_addr,
+               (unsigned long long)elf->sh[i].sh_offset,
+               (unsigned long long)elf->sh[i].sh_size,
+               (unsigned long long)elf->sh[i].sh_addralign);
+    }
+}
+
+static int inspect_find_symbols(ElfImage *elf, InspectSym **symtab, size_t *sym_count,
+                                const char **strtab, size_t *strtab_len)
+{
+    *symtab = NULL; *sym_count = 0; *strtab = NULL; *strtab_len = 0;
+    if (!elf->sh) return 1;
+    for (uint16_t i = 1; i < elf->eh.e_shnum; i++) {
+        if ((elf->sh[i].sh_type == 2 || elf->sh[i].sh_type == 11) &&
+            elf->sh[i].sh_entsize == sizeof(InspectSym)) {
+            if (!range_ok(elf->sh[i].sh_offset, elf->sh[i].sh_size, elf->len)) {
+                fprintf(stderr, "error: malformed ELF symbol table\n");
+                return 0;
+            }
+            *symtab = (InspectSym *)(void *)(elf->buf + elf->sh[i].sh_offset);
+            *sym_count = (size_t)(elf->sh[i].sh_size / elf->sh[i].sh_entsize);
+            if (elf->sh[i].sh_link < elf->eh.e_shnum &&
+                range_ok(elf->sh[elf->sh[i].sh_link].sh_offset, elf->sh[elf->sh[i].sh_link].sh_size, elf->len)) {
+                *strtab = (const char *)(elf->buf + elf->sh[elf->sh[i].sh_link].sh_offset);
+                *strtab_len = (size_t)elf->sh[elf->sh[i].sh_link].sh_size;
+            }
+            return 1;
+        }
+    }
+    return 1;
+}
+
+static void inspect_print_symbols(ElfImage *elf)
+{
+    InspectSym *symtab = NULL;
+    size_t sym_count = 0, strtab_len = 0;
+    const char *strtab = NULL;
+    puts("Symbols:");
+    puts("name\tvalue\tsize\tbinding\ttype\tsection");
+    if (!inspect_find_symbols(elf, &symtab, &sym_count, &strtab, &strtab_len))
+        return;
+    for (size_t i = 0; i < sym_count; i++) {
+        InspectSym *s = &symtab[i];
+        const char *sec = s->st_shndx == 0 ? "<undef>" :
+            (s->st_shndx == 0xfff1 ? "<abs>" :
+             (elf->sh && s->st_shndx < elf->eh.e_shnum ?
+              inspect_section_name(elf->shstr, elf->shstr_len, elf->sh[s->st_shndx].sh_name) : "<bad-section>"));
+        printf("%s\t0x%llx\t%llu\t%s\t%s\t%s\n",
+               inspect_symbol_name(strtab, strtab_len, s->st_name),
+               (unsigned long long)s->st_value,
+               (unsigned long long)s->st_size,
+               inspect_bind(s->st_info),
+               inspect_sym_type(s->st_info),
+               sec);
+    }
+}
+
+static void inspect_print_relocs(ElfImage *elf)
+{
+    InspectSym *symtab = NULL;
+    size_t sym_count = 0, strtab_len = 0;
+    const char *strtab = NULL;
+    puts("Relocations:");
+    puts("section\toffset\ttype\tsymbol\taddend");
+    if (!elf->sh || !inspect_find_symbols(elf, &symtab, &sym_count, &strtab, &strtab_len))
+        return;
+    for (uint16_t i = 1; i < elf->eh.e_shnum; i++) {
+        if (elf->sh[i].sh_type != 4 || elf->sh[i].sh_entsize != sizeof(InspectRela))
+            continue;
+        if (!range_ok(elf->sh[i].sh_offset, elf->sh[i].sh_size, elf->len)) {
+            fprintf(stderr, "error: malformed ELF relocation section\n");
+            return;
+        }
+        InspectRela *rela = (InspectRela *)(void *)(elf->buf + elf->sh[i].sh_offset);
+        size_t count = (size_t)(elf->sh[i].sh_size / elf->sh[i].sh_entsize);
+        for (size_t j = 0; j < count; j++) {
+            uint32_t sym_index = (uint32_t)(rela[j].r_info >> 32);
+            uint32_t type = (uint32_t)(rela[j].r_info & 0xffffffffu);
+            const char *sym = sym_index < sym_count ?
+                inspect_symbol_name(strtab, strtab_len, symtab[sym_index].st_name) : "<bad-symbol>";
+            printf("%s\t0x%llx\t%s\t%s\t%lld\n",
+                   inspect_section_name(elf->shstr, elf->shstr_len, elf->sh[i].sh_name),
+                   (unsigned long long)rela[j].r_offset,
+                   inspect_reloc_type(type), sym, (long long)rela[j].r_addend);
+        }
+    }
+}
+
 static int run_inspect(int argc, char **argv)
 {
     const char *path = NULL;
-    int show_symbols = 0, show_sections = 0, show_relocs = 0;
+    int show_headers = 0, show_segments = 0, show_sections = 0, show_symbols = 0, show_relocs = 0;
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--symbols") == 0) {
-            show_symbols = 1;
-        } else if (strcmp(argv[i], "--sections") == 0) {
-            show_sections = 1;
-        } else if (strcmp(argv[i], "--relocs") == 0) {
-            show_relocs = 1;
-        } else if (argv[i][0] == '-') {
+        if (strcmp(argv[i], "--headers") == 0) show_headers = 1;
+        else if (strcmp(argv[i], "--segments") == 0) show_segments = 1;
+        else if (strcmp(argv[i], "--sections") == 0) show_sections = 1;
+        else if (strcmp(argv[i], "--symbols") == 0) show_symbols = 1;
+        else if (strcmp(argv[i], "--relocs") == 0) show_relocs = 1;
+        else if (strcmp(argv[i], "--all") == 0) show_headers = show_segments = show_sections = show_symbols = show_relocs = 1;
+        else if (argv[i][0] == '-') {
             fprintf(stderr, "error: unknown inspect option '%s'\n", argv[i]);
             return 2;
         } else if (!path) {
             path = argv[i];
         } else {
-            fprintf(stderr, "error: inspect accepts one object file\n");
+            fprintf(stderr, "error: inspect accepts one file\n");
             return 2;
         }
     }
     if (!path) {
-        fprintf(stderr, "error: missing object file for inspect\n");
+        fprintf(stderr, "error: missing file for inspect\n");
         return 2;
     }
-    if (!show_symbols && !show_sections && !show_relocs)
-        show_symbols = show_sections = show_relocs = 1;
+    if (!show_headers && !show_segments && !show_sections && !show_symbols && !show_relocs)
+        show_headers = show_segments = show_sections = show_symbols = show_relocs = 1;
+    ElfImage elf;
+    if (!load_elf_image(path, &elf)) {
+        free_elf_image(&elf);
+        return 1;
+    }
+    int printed = 0;
+#define INSPECT_SECTION(fn) do { if (printed) putchar('\n'); fn(&elf); printed = 1; } while (0)
+    if (show_headers) INSPECT_SECTION(inspect_print_headers);
+    if (show_segments) INSPECT_SECTION(inspect_print_segments);
+    if (show_sections) INSPECT_SECTION(inspect_print_sections);
+    if (show_symbols) INSPECT_SECTION(inspect_print_symbols);
+    if (show_relocs) INSPECT_SECTION(inspect_print_relocs);
+#undef INSPECT_SECTION
+    free_elf_image(&elf);
+    return 0;
+}
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "error: cannot read object file '%s'\n", path);
+static const char *dis_reg64(int code)
+{
+    static const char *names[] = {
+        "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+        "r8","r9","r10","r11","r12","r13","r14","r15"
+    };
+    return names[code & 15];
+}
+
+static const char *dis_reg32(int code)
+{
+    static const char *names[] = {
+        "eax","ecx","edx","ebx","esp","ebp","esi","edi",
+        "r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d"
+    };
+    return names[code & 15];
+}
+
+static uint32_t dis_u32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t dis_u64(const unsigned char *p)
+{
+    uint64_t lo = dis_u32(p);
+    uint64_t hi = dis_u32(p + 4);
+    return lo | (hi << 32);
+}
+
+static const char *jcc_name_from_low(unsigned low)
+{
+    static const char *names[] = {
+        "jo","jno","jb","jae","je","jne","jbe","ja",
+        "js","jns","jp","jnp","jl","jge","jle","jg"
+    };
+    return names[low & 15];
+}
+
+static void dis_bytes(const unsigned char *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        printf("%02x%s", p[i], i + 1 == n ? "" : " ");
+}
+
+static int dis_modrm_operand(char *rm_out, size_t rm_len, char *reg_out, size_t reg_len,
+                             const unsigned char *buf, size_t len, size_t *idx,
+                             int rex_w, int rex_r, int rex_x, int rex_b,
+                             uint64_t instr_addr)
+{
+    if (*idx >= len)
+        return 0;
+    unsigned char m = buf[(*idx)++];
+    unsigned mod = (m >> 6) & 3;
+    unsigned reg = ((m >> 3) & 7) | (rex_r ? 8 : 0);
+    unsigned rm = (m & 7) | (rex_b ? 8 : 0);
+    snprintf(reg_out, reg_len, "%s", rex_w ? dis_reg64((int)reg) : dis_reg32((int)reg));
+    if (mod == 3) {
+        snprintf(rm_out, rm_len, "%s", rex_w ? dis_reg64((int)rm) : dis_reg32((int)rm));
         return 1;
     }
-    InspectEhdr eh;
-    if (fread(&eh, 1, sizeof(eh), f) != sizeof(eh) ||
-        eh.e_ident[0] != 0x7f || eh.e_ident[1] != 'E' ||
-        eh.e_ident[2] != 'L' || eh.e_ident[3] != 'F' ||
-        eh.e_ident[4] != 2 || eh.e_ident[5] != 1 || eh.e_type != 1) {
-        fclose(f);
-        fprintf(stderr, "error: inspect supports ELF64 relocatable object files only\n");
-        return 1;
+
+    int has_sib = ((m & 7) == 4);
+    int base = (int)rm;
+    int index = -1;
+    int scale = 1;
+    if (has_sib) {
+        if (*idx >= len)
+            return 0;
+        unsigned char s = buf[(*idx)++];
+        scale = 1 << ((s >> 6) & 3);
+        unsigned idx_reg = ((s >> 3) & 7) | (rex_x ? 8 : 0);
+        unsigned base_reg = (s & 7) | (rex_b ? 8 : 0);
+        if ((idx_reg & 7) != 4)
+            index = (int)idx_reg;
+        base = (int)base_reg;
     }
-    if (!eh.e_shoff || !eh.e_shnum || eh.e_shentsize != sizeof(InspectShdr)) {
-        fclose(f);
-        fprintf(stderr, "error: malformed ELF section table\n");
-        return 1;
+
+    int64_t disp = 0;
+    int rip_relative = 0;
+    if (mod == 1) {
+        if (*idx >= len)
+            return 0;
+        disp = (int8_t)buf[(*idx)++];
+    } else if (mod == 2 || (mod == 0 && !has_sib && (rm & 7) == 5) ||
+               (mod == 0 && has_sib && (base & 7) == 5)) {
+        if (*idx + 4 > len)
+            return 0;
+        disp = (int32_t)dis_u32(buf + *idx);
+        *idx += 4;
+        if (mod == 0 && !has_sib && (rm & 7) == 5)
+            rip_relative = 1;
     }
-    InspectShdr *sh = kasm_xrealloc(NULL, (size_t)eh.e_shnum * sizeof(InspectShdr));
-    if (!read_exact(f, eh.e_shoff, sh, (size_t)eh.e_shnum * sizeof(InspectShdr))) {
-        free(sh);
-        fclose(f);
-        fprintf(stderr, "error: cannot read ELF section table\n");
-        return 1;
+
+    char tmp[192];
+    if (rip_relative) {
+        snprintf(tmp, sizeof(tmp), "[rel 0x%llx]", (unsigned long long)(instr_addr + *idx + disp));
+    } else {
+        snprintf(tmp, sizeof(tmp), "[%s", dis_reg64(base));
+        if (index >= 0) {
+            size_t used = strlen(tmp);
+            snprintf(tmp + used, sizeof(tmp) - used, " + %s*%d", dis_reg64(index), scale);
+        }
+        if (disp > 0) {
+            size_t used = strlen(tmp);
+            snprintf(tmp + used, sizeof(tmp) - used, " + %lld", (long long)disp);
+        } else if (disp < 0) {
+            size_t used = strlen(tmp);
+            snprintf(tmp + used, sizeof(tmp) - used, " - %lld", (long long)-disp);
+        }
+        size_t used = strlen(tmp);
+        snprintf(tmp + used, sizeof(tmp) - used, "]");
     }
-    char *shstr = NULL;
-    size_t shstr_len = 0;
-    if (eh.e_shstrndx < eh.e_shnum && sh[eh.e_shstrndx].sh_size) {
-        shstr_len = (size_t)sh[eh.e_shstrndx].sh_size;
-        shstr = kasm_xrealloc(NULL, shstr_len);
-        if (!read_exact(f, sh[eh.e_shstrndx].sh_offset, shstr, shstr_len)) {
-            free(shstr);
-            free(sh);
-            fclose(f);
-            fprintf(stderr, "error: cannot read ELF section names\n");
+    snprintf(rm_out, rm_len, "%s", tmp);
+    return 1;
+}
+
+static size_t dis_one(const unsigned char *buf, size_t len, uint64_t addr)
+{
+    size_t i = 0;
+    int rex_w = 0, rex_r = 0, rex_x = 0, rex_b = 0;
+    if (len && buf[i] >= 0x40 && buf[i] <= 0x4f) {
+        unsigned char r = buf[i++];
+        rex_w = (r >> 3) & 1;
+        rex_r = (r >> 2) & 1;
+        rex_x = (r >> 1) & 1;
+        rex_b = r & 1;
+    }
+    if (i >= len)
+        return 0;
+    unsigned char op = buf[i++];
+    char text[256] = { 0 };
+
+    if (op == 0x0f && i < len && buf[i] == 0x05) {
+        i++;
+        snprintf(text, sizeof(text), "syscall");
+    } else if (op == 0xc3) {
+        snprintf(text, sizeof(text), "ret");
+    } else if (op == 0x90) {
+        snprintf(text, sizeof(text), "nop");
+    } else if ((op & 0xf8) == 0x50) {
+        snprintf(text, sizeof(text), "push %s", dis_reg64((op & 7) | (rex_b ? 8 : 0)));
+    } else if ((op & 0xf8) == 0x58) {
+        snprintf(text, sizeof(text), "pop %s", dis_reg64((op & 7) | (rex_b ? 8 : 0)));
+    } else if (op == 0x6a && i < len) {
+        snprintf(text, sizeof(text), "push %d", (int)(int8_t)buf[i]);
+        i++;
+    } else if (op == 0x68 && i + 4 <= len) {
+        snprintf(text, sizeof(text), "push %d", (int)(int32_t)dis_u32(buf + i));
+        i += 4;
+    } else if ((op & 0xf8) == 0xb8) {
+        int reg = (op & 7) | (rex_b ? 8 : 0);
+        if (rex_w && i + 8 <= len) {
+            snprintf(text, sizeof(text), "mov %s, 0x%llx", dis_reg64(reg), (unsigned long long)dis_u64(buf + i));
+            i += 8;
+        } else if (i + 4 <= len) {
+            snprintf(text, sizeof(text), "mov %s, %u", dis_reg32(reg), dis_u32(buf + i));
+            i += 4;
+        } else {
+            i = 1;
+            snprintf(text, sizeof(text), "db 0x%02x", buf[0]);
+        }
+    } else if (op == 0xe8 && i + 4 <= len) {
+        int32_t d = (int32_t)dis_u32(buf + i);
+        i += 4;
+        snprintf(text, sizeof(text), "call 0x%llx", (unsigned long long)(addr + i + d));
+    } else if (op == 0xe9 && i + 4 <= len) {
+        int32_t d = (int32_t)dis_u32(buf + i);
+        i += 4;
+        snprintf(text, sizeof(text), "jmp 0x%llx", (unsigned long long)(addr + i + d));
+    } else if (op == 0xeb && i < len) {
+        int8_t d = (int8_t)buf[i++];
+        snprintf(text, sizeof(text), "jmp 0x%llx", (unsigned long long)(addr + i + d));
+    } else if (op >= 0x70 && op <= 0x7f && i < len) {
+        int8_t d = (int8_t)buf[i++];
+        snprintf(text, sizeof(text), "%s 0x%llx", jcc_name_from_low(op & 15),
+                 (unsigned long long)(addr + i + d));
+    } else if (op == 0x0f && i < len && buf[i] >= 0x80 && buf[i] <= 0x8f && i + 4 < len) {
+        unsigned char j = buf[i++];
+        int32_t d = (int32_t)dis_u32(buf + i);
+        i += 4;
+        snprintf(text, sizeof(text), "%s 0x%llx", jcc_name_from_low(j & 15),
+                 (unsigned long long)(addr + i + d));
+    } else {
+        const char *mn = NULL;
+        int dir_reg_rm = 0;
+        if (op == 0x89) { mn = "mov"; dir_reg_rm = 0; }
+        else if (op == 0x8b) { mn = "mov"; dir_reg_rm = 1; }
+        else if (op == 0x8d) { mn = "lea"; dir_reg_rm = 1; }
+        else if (op == 0x01) { mn = "add"; dir_reg_rm = 0; }
+        else if (op == 0x03) { mn = "add"; dir_reg_rm = 1; }
+        else if (op == 0x29) { mn = "sub"; dir_reg_rm = 0; }
+        else if (op == 0x2b) { mn = "sub"; dir_reg_rm = 1; }
+        else if (op == 0x31) { mn = "xor"; dir_reg_rm = 0; }
+        else if (op == 0x33) { mn = "xor"; dir_reg_rm = 1; }
+        else if (op == 0x39) { mn = "cmp"; dir_reg_rm = 0; }
+        else if (op == 0x3b) { mn = "cmp"; dir_reg_rm = 1; }
+        else if (op == 0x85) { mn = "test"; dir_reg_rm = 0; }
+        if (mn) {
+            char rm[192], reg[32];
+            size_t modrm_i = i;
+            if (dis_modrm_operand(rm, sizeof(rm), reg, sizeof(reg), buf, len, &modrm_i,
+                                  rex_w, rex_r, rex_x, rex_b, addr)) {
+                i = modrm_i;
+                if (dir_reg_rm)
+                    snprintf(text, sizeof(text), "%s %s, %s", mn, reg, rm);
+                else
+                    snprintf(text, sizeof(text), "%s %s, %s", mn, rm, reg);
+            }
+        } else if ((op == 0x81 || op == 0x83 || op == 0xc7 || op == 0xf7) && i < len) {
+            char rm[192], reg[32];
+            size_t modrm_i = i;
+            if (dis_modrm_operand(rm, sizeof(rm), reg, sizeof(reg), buf, len, &modrm_i,
+                                  rex_w, rex_r, rex_x, rex_b, addr)) {
+                unsigned ext = (buf[i] >> 3) & 7;
+                const char *grp = op == 0xc7 ? "mov" :
+                    op == 0xf7 ? "test" :
+                    ext == 0 ? "add" : ext == 4 ? "and" : ext == 5 ? "sub" :
+                    ext == 6 ? "xor" : ext == 7 ? "cmp" : NULL;
+                int imm_size = op == 0x83 ? 1 : 4;
+                if (grp && modrm_i + (size_t)imm_size <= len) {
+                    int64_t imm = imm_size == 1 ? (int8_t)buf[modrm_i] : (int32_t)dis_u32(buf + modrm_i);
+                    i = modrm_i + (size_t)imm_size;
+                    snprintf(text, sizeof(text), "%s %s, %lld", grp, rm, (long long)imm);
+                }
+            }
+        } else if ((op == 0x05 || op == 0x0d || op == 0x25 ||
+                    op == 0x2d || op == 0x35 || op == 0x3d) && i + 4 <= len) {
+            const char *mn2 = op == 0x05 ? "add" : op == 0x0d ? "or" :
+                op == 0x25 ? "and" : op == 0x2d ? "sub" :
+                op == 0x35 ? "xor" : "cmp";
+            snprintf(text, sizeof(text), "%s %s, %d", mn2, rex_w ? "rax" : "eax",
+                     (int)(int32_t)dis_u32(buf + i));
+            i += 4;
+        }
+        if (!*text) {
+            i = 1;
+            snprintf(text, sizeof(text), "db 0x%02x", buf[0]);
+        }
+    }
+
+    printf("%016llx:  ", (unsigned long long)addr);
+    dis_bytes(buf, i);
+    for (size_t pad = i; pad < 8; pad++)
+        printf("   ");
+    printf("    %s\n", text);
+    return i ? i : 1;
+}
+
+static int elf_find_text_range(ElfImage *elf, const char *section_name,
+                               uint64_t start, int have_start, uint64_t length,
+                               const unsigned char **bytes, size_t *size, uint64_t *addr)
+{
+    if (section_name && elf->sh) {
+        for (uint16_t i = 1; i < elf->eh.e_shnum; i++) {
+            const char *name = inspect_section_name(elf->shstr, elf->shstr_len, elf->sh[i].sh_name);
+            if (strcmp(name, section_name) == 0) {
+                if (!range_ok(elf->sh[i].sh_offset, elf->sh[i].sh_size, elf->len))
+                    return 0;
+                *bytes = elf->buf + elf->sh[i].sh_offset;
+                *size = (size_t)elf->sh[i].sh_size;
+                *addr = elf->sh[i].sh_addr;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (have_start) {
+        for (uint16_t i = 0; i < elf->eh.e_phnum; i++) {
+            if (elf->ph[i].p_type == 1 && start >= elf->ph[i].p_vaddr &&
+                start < elf->ph[i].p_vaddr + elf->ph[i].p_filesz) {
+                uint64_t delta = start - elf->ph[i].p_vaddr;
+                uint64_t avail = elf->ph[i].p_filesz - delta;
+                if (!range_ok(elf->ph[i].p_offset + delta, avail, elf->len))
+                    return 0;
+                *bytes = elf->buf + elf->ph[i].p_offset + delta;
+                *size = (size_t)(length && length < avail ? length : avail);
+                *addr = start;
+                return 1;
+            }
+        }
+    }
+    if (elf->sh) {
+        for (uint16_t i = 1; i < elf->eh.e_shnum; i++) {
+            const char *name = inspect_section_name(elf->shstr, elf->shstr_len, elf->sh[i].sh_name);
+            if (strcmp(name, ".text") == 0 && range_ok(elf->sh[i].sh_offset, elf->sh[i].sh_size, elf->len)) {
+                *bytes = elf->buf + elf->sh[i].sh_offset;
+                *size = (size_t)elf->sh[i].sh_size;
+                *addr = elf->sh[i].sh_addr;
+                return 1;
+            }
+        }
+    }
+    for (uint16_t i = 0; i < elf->eh.e_phnum; i++) {
+        if (elf->ph[i].p_type == 1 && (elf->ph[i].p_flags & 1) &&
+            range_ok(elf->ph[i].p_offset, elf->ph[i].p_filesz, elf->len)) {
+            *bytes = elf->buf + elf->ph[i].p_offset;
+            *size = (size_t)elf->ph[i].p_filesz;
+            *addr = elf->ph[i].p_vaddr;
             return 1;
         }
     }
+    return 0;
+}
 
-    if (show_sections) {
-        puts("Sections:");
-        puts("section\tsize\talignment\tflags\tfile_offset\taddress");
-        for (uint16_t i = 1; i < eh.e_shnum; i++) {
-            char flags[4];
-            inspect_flags(sh[i].sh_flags, flags, sizeof(flags));
-            printf("%s\t%llu\t%llu\t%s\t0x%llx\t0x%llx\n",
-                   inspect_section_name(shstr, shstr_len, sh[i].sh_name),
-                   (unsigned long long)sh[i].sh_size,
-                   (unsigned long long)sh[i].sh_addralign,
-                   flags,
-                   (unsigned long long)sh[i].sh_offset,
-                   (unsigned long long)sh[i].sh_addr);
+static int run_disasm(int argc, char **argv)
+{
+    const char *path = NULL;
+    const char *section = NULL;
+    uint64_t start = 0, length = 0;
+    int have_start = 0;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--section") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: option '--section' requires an argument\n");
+                return 2;
+            }
+            section = argv[++i];
+        } else if (strcmp(argv[i], "--start") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: option '--start' requires an argument\n");
+                return 2;
+            }
+            int64_t v = 0;
+            if (!kasm_parse_int(argv[++i], &v) || v < 0) {
+                fprintf(stderr, "error: invalid --start value\n");
+                return 2;
+            }
+            start = (uint64_t)v;
+            have_start = 1;
+        } else if (strcmp(argv[i], "--length") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: option '--length' requires an argument\n");
+                return 2;
+            }
+            int64_t v = 0;
+            if (!kasm_parse_int(argv[++i], &v) || v < 0) {
+                fprintf(stderr, "error: invalid --length value\n");
+                return 2;
+            }
+            length = (uint64_t)v;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "error: unknown disasm option '%s'\n", argv[i]);
+            return 2;
+        } else if (!path) {
+            path = argv[i];
+        } else {
+            fprintf(stderr, "error: disasm accepts one file\n");
+            return 2;
         }
     }
-
-    InspectSym *symtab = NULL;
-    size_t sym_count = 0;
-    char *strtab = NULL;
-    size_t strtab_len = 0;
-    uint16_t symtab_index = 0;
-    for (uint16_t i = 1; i < eh.e_shnum; i++) {
-        if (sh[i].sh_type == 2 && sh[i].sh_entsize == sizeof(InspectSym)) {
-            symtab_index = i;
-            sym_count = (size_t)(sh[i].sh_size / sh[i].sh_entsize);
-            symtab = kasm_xrealloc(NULL, sym_count * sizeof(InspectSym));
-            if (!read_exact(f, sh[i].sh_offset, symtab, sym_count * sizeof(InspectSym))) {
-                free(symtab); free(strtab); free(shstr); free(sh); fclose(f);
-                fprintf(stderr, "error: cannot read ELF symbol table\n");
-                return 1;
-            }
-            if (sh[i].sh_link < eh.e_shnum) {
-                strtab_len = (size_t)sh[sh[i].sh_link].sh_size;
-                strtab = kasm_xrealloc(NULL, strtab_len ? strtab_len : 1);
-                if (strtab_len && !read_exact(f, sh[sh[i].sh_link].sh_offset, strtab, strtab_len)) {
-                    free(symtab); free(strtab); free(shstr); free(sh); fclose(f);
-                    fprintf(stderr, "error: cannot read ELF string table\n");
-                    return 1;
-                }
-            }
-            break;
-        }
+    if (!path) {
+        fprintf(stderr, "error: missing file for disasm\n");
+        return 2;
     }
-
-    if (show_symbols) {
-        if (show_sections)
-            putchar('\n');
-        puts("Symbols:");
-        puts("name\tbinding\tsection\toffset\taddress\ttype\tlocation");
-        for (size_t i = 0; i < sym_count; i++) {
-            InspectSym *s = &symtab[i];
-            const char *sec = s->st_shndx == 0 ? "<undef>" :
-                (s->st_shndx == 0xfff1 ? "<abs>" :
-                 (s->st_shndx < eh.e_shnum ? inspect_section_name(shstr, shstr_len, sh[s->st_shndx].sh_name) : "<bad-section>"));
-            printf("%s\t%s\t%s\t0x%llx\t0x%llx\t%s\tn/a\n",
-                   inspect_symbol_name(strtab, strtab_len, s->st_name),
-                   inspect_bind(s->st_info), sec,
-                   (unsigned long long)s->st_value,
-                   (unsigned long long)s->st_value,
-                   inspect_sym_type(s->st_info));
-        }
+    ElfImage elf;
+    if (!load_elf_image(path, &elf)) {
+        free_elf_image(&elf);
+        return 1;
     }
-
-    if (show_relocs) {
-        if (show_sections || show_symbols)
-            putchar('\n');
-        puts("Relocations:");
-        puts("section\toffset\ttype\tsymbol\taddend\tlocation");
-        for (uint16_t i = 1; i < eh.e_shnum; i++) {
-            if (sh[i].sh_type != 4 || sh[i].sh_entsize != sizeof(InspectRela))
-                continue;
-            size_t count = (size_t)(sh[i].sh_size / sh[i].sh_entsize);
-            InspectRela *rela = kasm_xrealloc(NULL, count * sizeof(InspectRela));
-            if (!read_exact(f, sh[i].sh_offset, rela, count * sizeof(InspectRela))) {
-                free(rela); free(symtab); free(strtab); free(shstr); free(sh); fclose(f);
-                fprintf(stderr, "error: cannot read ELF relocations\n");
-                return 1;
-            }
-            for (size_t j = 0; j < count; j++) {
-                uint32_t sym_index = (uint32_t)(rela[j].r_info >> 32);
-                uint32_t type = (uint32_t)(rela[j].r_info & 0xffffffffu);
-                const char *sym = sym_index < sym_count ?
-                    inspect_symbol_name(strtab, strtab_len, symtab[sym_index].st_name) : "<bad-symbol>";
-                printf("%s\t0x%llx\t%s\t%s\t%lld\tn/a\n",
-                       inspect_section_name(shstr, shstr_len, sh[i].sh_name),
-                       (unsigned long long)rela[j].r_offset,
-                       inspect_reloc_type(type), sym, (long long)rela[j].r_addend);
-            }
-            free(rela);
-        }
+    const unsigned char *bytes = NULL;
+    size_t size = 0;
+    uint64_t addr = 0;
+    if (!elf_find_text_range(&elf, section, start, have_start, length, &bytes, &size, &addr)) {
+        fprintf(stderr, "error: cannot locate bytes to disassemble\n");
+        free_elf_image(&elf);
+        return 1;
     }
-
-    free(symtab);
-    free(strtab);
-    free(shstr);
-    free(sh);
-    fclose(f);
-    (void)symtab_index;
+    if (length && length < size)
+        size = (size_t)length;
+    size_t off = 0;
+    while (off < size) {
+        size_t n = dis_one(bytes + off, size - off, addr + off);
+        if (!n) n = 1;
+        off += n;
+    }
+    free_elf_image(&elf);
     return 0;
 }
 
@@ -2605,6 +3149,8 @@ int main(int argc, char **argv)
         return run_link_command(argc, argv);
     if (argc > 1 && strcmp(argv[1], "inspect") == 0)
         return run_inspect(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "disasm") == 0)
+        return run_disasm(argc, argv);
 
     char **inputs = NULL;
     size_t input_count = 0;
@@ -2628,6 +3174,9 @@ int main(int argc, char **argv)
             format_set = 1;
         } else if (strcmp(argv[i], "--tiny") == 0 || strcmp(argv[i], "-Oz") == 0) {
             as.tiny = 1;
+        } else if (strcmp(argv[i], "--no-tiny") == 0) {
+            as.tiny = 0;
+            as.tiny_report = 0;
         } else if (strcmp(argv[i], "--tiny-report") == 0) {
             as.tiny = 1;
             as.tiny_report = 1;
@@ -2660,7 +3209,7 @@ int main(int argc, char **argv)
             const char *fmt = argv[++i];
             if (strcmp(fmt, "text") != 0) {
                 fprintf(stderr, "error: unsupported explain format '%s'\n", fmt);
-                fprintf(stderr, "hint: KASM v2.1 supports --explain-format text\n");
+                fprintf(stderr, "hint: KASM 0.1.0 supports --explain-format text\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--explain-file") == 0) {
@@ -2747,7 +3296,7 @@ int main(int argc, char **argv)
                 return 2;
             }
         } else if (strcmp(argv[i], "--version") == 0) {
-            puts("KASM 2.1.0");
+            puts("KASM 0.1.0");
             return 0;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(stdout);

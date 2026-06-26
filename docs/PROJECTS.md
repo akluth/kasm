@@ -1,6 +1,6 @@
 # Project Build Mode
 
-KASM v2.0 includes a small project build command for real multi-file examples:
+KASM includes a small project build command for real multi-file examples:
 
 ```sh
 kasm build

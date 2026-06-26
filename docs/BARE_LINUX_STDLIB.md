@@ -1,6 +1,6 @@
 # Bare Linux Standard Library
 
-KASM v2.1 adds a tiny bare-Linux helper layer under `lib/kasm/std/linux`.
+KASM provides a tiny bare-Linux helper layer under `lib/kasm/std/linux`.
 It is not libc, not dynamically linked, and not a hidden runtime. Helpers expand
 to ordinary KASM assembly and Linux x86-64 syscalls.
 
@@ -90,4 +90,4 @@ syscalls stay inspectable.
 - Cross-file programs still assemble to objects first and should be linked with
   `ld` or `kasm link` where the internal linker supports the object files.
 - `kstrlen` is intentionally not included yet; a transparent runtime loop would
-  be larger than this v2.1 layer needs.
+  be larger than this helper layer needs.

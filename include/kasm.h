@@ -169,6 +169,10 @@ typedef struct {
     uint64_t tiny_jumps_shortened;
     uint64_t tiny_near_jumps;
     uint64_t tiny_imm8_used;
+    uint64_t tiny_push_imm8_used;
+    uint64_t tiny_accumulator_used;
+    uint64_t tiny_disp8_used;
+    uint64_t tiny_disp0_used;
     uint64_t tiny_bytes_saved;
     uint64_t tiny_final_size;
     int errors;

@@ -656,7 +656,7 @@ static int expand_file(Assembler *as, Preproc *pp, const char *path, ExpandedLin
         if (!in_macro && (word[0] == '%' || strcmp(word, "bits") == 0 ||
             strcmp(word, "org") == 0 || strcmp(word, "default") == 0)) {
             kasm_error(as, (SourceLoc){ path, line_no, 1 },
-                       "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM v2.1 syntax", word);
+                       "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM syntax", word);
             free(word);
             fclose(f);
             stack_pop(pp);
@@ -1155,7 +1155,8 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
             kasm_error(as, (SourceLoc){ as->path, line_no, col }, "label outside of section");
             return 0;
         }
-        kasm_symbol_define(as, name, *current, offsets[*current], 0, 0, line_no, col);
+        if (!kasm_symbol_define(as, name, *current, offsets[*current], 0, 0, line_no, col))
+            return 0;
         Statement st;
         memset(&st, 0, sizeof(st));
         st.type = ST_LABEL;
@@ -1186,7 +1187,8 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
         if (!kasm_eval_expr(as, expr, *current, current_offset, 0, &value,
                             (SourceLoc){ as->path, line_no, kasm_column_of(orig, expr) }))
             return 0;
-        kasm_symbol_define(as, name, SEC_NONE, 0, 1, value, line_no, col);
+        if (!kasm_symbol_define(as, name, SEC_NONE, 0, 1, value, line_no, col))
+            return 0;
         Statement st;
         memset(&st, 0, sizeof(st));
         st.type = ST_CONST;
@@ -1211,7 +1213,7 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
     if (op[0] == '%' || strcmp(op, "bits") == 0 ||
         strcmp(op, "org") == 0 || strcmp(op, "default") == 0) {
         kasm_error(as, (SourceLoc){ as->path, line_no, op_col },
-                   "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM v2.1 syntax", op);
+                   "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM syntax", op);
         free(op);
         return 0;
     }

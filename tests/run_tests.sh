@@ -31,10 +31,11 @@ expect_fail() {
     pass "$name"
 }
 
-./kasm --version | grep -q "KASM 2.1.0"
+./kasm --version | grep -q "KASM 0.1.0"
 ./kasm --help | grep -q -- "--dump-symbols"
 ./kasm --help | grep -q -- "--dump-all"
 ./kasm --help | grep -q -- "kasm inspect"
+./kasm --help | grep -q -- "kasm disasm"
 ./kasm --help | grep -q -- "kasm link"
 ./kasm --help | grep -q -- "--internal-linker"
 ./kasm --help | grep -q -- "elf64-obj"
@@ -45,6 +46,7 @@ expect_fail() {
 ./kasm --help | grep -q -- "--teach"
 ./kasm --help | grep -q -- "--teach-level"
 ./kasm --help | grep -q -- "--tiny"
+./kasm --help | grep -q -- "--no-tiny"
 ./kasm --help | grep -q -- "--tiny-report"
 ./kasm --help | grep -q -- "--combine"
 ./kasm --help | grep -q -- "--hints"
@@ -58,6 +60,7 @@ expect_fail() {
 ./kasm --help | grep -q -- "include/preprocessor:"
 ./kasm --help | grep -q -- "syscalls:"
 ./kasm --help | grep -q -- "explain/list/map:"
+./kasm --help | grep -q -- "binary tools:"
 ./kasm --help | grep -q -- "debug/dump:"
 ./kasm --help | grep -q -- "general:"
 ./kasm --print-include-paths | grep -q "lib/kasm"
@@ -515,21 +518,95 @@ cat > "$tmp/tiny_imm.asm" <<'ASM'
 entry _start
 section .text
 _start:
+    push 7
+    add rax, 200
     cmp rax, 1
     cmp rax, 200
     mov eax, 60
     syscall
 ASM
 ./kasm --tiny "$tmp/tiny_imm.asm" -f bin -o "$tmp/tiny_imm.bin"
-od -An -tx1 "$tmp/tiny_imm.bin" > "$tmp/tiny_imm.hex"
+od -An -tx1 "$tmp/tiny_imm.bin" | tr -s ' \n' ' ' > "$tmp/tiny_imm.hex"
+grep -q "6a 07" "$tmp/tiny_imm.hex" || fail "tiny push imm8"
+grep -q "48 05 c8 00 00 00" "$tmp/tiny_imm.hex" || fail "tiny accumulator imm32"
 grep -q "48 83 f8 01" "$tmp/tiny_imm.hex" || fail "tiny imm8 cmp"
-grep -q "48 81 f8 c8 00 00 00" "$tmp/tiny_imm.hex" || fail "tiny imm32 cmp"
+grep -q "48 3d c8 00 00 00" "$tmp/tiny_imm.hex" || fail "tiny accumulator cmp imm32"
 grep -q "b8 3c 00 00 00" "$tmp/tiny_imm.hex" || fail "tiny mov r32 accumulator"
 pass "tiny immediate/register-width encodings"
+
+./kasm --tiny --no-tiny "$tmp/tiny_jumps.asm" -f bin -o "$tmp/no_tiny_jumps.bin"
+od -An -tx1 -N1 "$tmp/no_tiny_jumps.bin" | grep -q "e9" || fail "no-tiny disabled tiny mode"
+pass "no tiny override"
+
+cat > "$tmp/tiny_cond_forward.asm" <<'ASM'
+entry _start
+section .text
+_start:
+    cmp rax, 0
+    je done
+    mov rax, 1
+done:
+    ret
+ASM
+./kasm --tiny "$tmp/tiny_cond_forward.asm" -f bin -o "$tmp/tiny_cond_forward.bin"
+od -An -tx1 "$tmp/tiny_cond_forward.bin" | grep -q "74" || fail "tiny conditional short forward jump"
+pass "tiny conditional short forward jump"
+
+cat > "$tmp/tiny_fixpoint.asm" <<'ASM'
+entry _start
+section .text
+_start:
+    jmp done
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+    cmp rax, 1
+done:
+    ret
+ASM
+./kasm --tiny "$tmp/tiny_fixpoint.asm" -f bin -o "$tmp/tiny_fixpoint.bin"
+od -An -tx1 -N1 "$tmp/tiny_fixpoint.bin" | grep -q "eb" || fail "tiny fixpoint relaxation"
+pass "tiny jump relaxation fixpoint"
+
+cat > "$tmp/tiny_mem.asm" <<'ASM'
+entry _start
+section .text
+_start:
+    mov rax, [rbx]
+    mov rcx, [rbx+7]
+    mov rdx, [rbx+200]
+    mov rax, [rbp]
+    mov r8, [r13]
+    ret
+ASM
+./kasm --tiny "$tmp/tiny_mem.asm" -f bin -o "$tmp/tiny_mem.bin"
+od -An -tx1 "$tmp/tiny_mem.bin" | tr -s ' \n' ' ' > "$tmp/tiny_mem.hex"
+grep -q "48 8b 03" "$tmp/tiny_mem.hex" || fail "tiny zero displacement"
+grep -q "48 8b 4b 07" "$tmp/tiny_mem.hex" || fail "tiny disp8"
+grep -q "48 8b 93 c8 00 00 00" "$tmp/tiny_mem.hex" || fail "tiny disp32 fallback"
+grep -q "48 8b 45 00" "$tmp/tiny_mem.hex" || fail "tiny rbp disp0 edge"
+grep -q "4d 8b 45 00" "$tmp/tiny_mem.hex" || fail "tiny r13 rex/disp0 edge"
+pass "tiny memory displacement encodings"
+
+./kasm --tiny --explain=deluxe "$tmp/tiny_mem.asm" -f bin -o "$tmp/tiny_mem_explain.bin" > "$tmp/tiny_mem_explain.txt"
+grep -q "tiny: mov r64, qword ptr \\[mem\\]; ModRM/SIB memory operand with no displacement" "$tmp/tiny_mem_explain.txt" || fail "tiny explain memory decision"
+grep -q "displacement: size=8 value=7" "$tmp/tiny_mem_explain.txt" || fail "tiny explain disp8"
+./kasm --tiny --explain=deluxe "$tmp/tiny_jumps.asm" -f bin -o "$tmp/tiny_jumps_explain.bin" > "$tmp/tiny_jumps_explain.txt"
+grep -q "tiny: selected short jump because target distance" "$tmp/tiny_jumps_explain.txt" || fail "tiny explain short jump"
+pass "tiny explain decisions"
 
 ./kasm --tiny --tiny-report "$tmp/tiny_imm.asm" -o "$tmp/tiny_report_bin" > "$tmp/tiny_report.txt"
 grep -q "Tiny mode report:" "$tmp/tiny_report.txt" || fail "tiny report header"
 grep -q "imm8 encodings used:" "$tmp/tiny_report.txt" || fail "tiny report imm8"
+grep -q "push imm8 encodings used:" "$tmp/tiny_report.txt" || fail "tiny report push imm8"
+grep -q "accumulator encodings used:" "$tmp/tiny_report.txt" || fail "tiny report accumulator"
+grep -q "disp8 memory encodings used:" "$tmp/tiny_report.txt" || fail "tiny report disp8"
 grep -q "estimated bytes saved:" "$tmp/tiny_report.txt" || fail "tiny report savings"
 grep -q "final output size:" "$tmp/tiny_report.txt" || fail "tiny report final size"
 pass "tiny report"
@@ -1148,7 +1225,7 @@ if ./kasm examples/hello.asm --explain-format json -o "$tmp/bad_explain_format" 
     fail "invalid explain format should fail"
 fi
 grep -q "unsupported explain format" "$tmp/bad_explain_format.err" || fail "invalid explain format diagnostic"
-grep -q "KASM v2.1 supports --explain-format text" "$tmp/bad_explain_format.err" || fail "invalid explain format hint"
+grep -q "KASM 0.1.0 supports --explain-format text" "$tmp/bad_explain_format.err" || fail "invalid explain format hint"
 pass "invalid explain format"
 
 ./kasm examples/stdlib_hello.asm -o "$tmp/stdlib_hello"
@@ -1588,15 +1665,61 @@ pass "dump relocs"
 
 ./kasm examples/object_start.asm -f obj -o "$tmp/inspect_object.o"
 ./kasm inspect "$tmp/inspect_object.o" > "$tmp/inspect_object.txt"
+grep -q "ELF Header:" "$tmp/inspect_object.txt" || fail "inspect header"
 grep -q "Sections:" "$tmp/inspect_object.txt" || fail "inspect sections"
 grep -q "Symbols:" "$tmp/inspect_object.txt" || fail "inspect symbols"
 grep -q "Relocations:" "$tmp/inspect_object.txt" || fail "inspect relocs"
+./kasm inspect --headers "$tmp/inspect_object.o" > "$tmp/inspect_headers.txt"
+grep -q "class.*ELF64" "$tmp/inspect_headers.txt" || fail "inspect headers class"
+grep -q "type.*REL" "$tmp/inspect_headers.txt" || fail "inspect headers type"
+./kasm inspect --sections "$tmp/inspect_object.o" > "$tmp/inspect_sections.txt"
+grep -q ".rela.text" "$tmp/inspect_sections.txt" || fail "inspect section relocs"
 ./kasm inspect "$tmp/inspect_object.o" --symbols > "$tmp/inspect_symbols.txt"
 grep -q "_start" "$tmp/inspect_symbols.txt" || fail "inspect symbol _start"
 if grep -q "Sections:" "$tmp/inspect_symbols.txt"; then
     fail "inspect --symbols leaked sections"
 fi
+./kasm inspect --relocs "$tmp/inspect_object.o" > "$tmp/inspect_relocs.txt"
+grep -q "R_X86_64_PC32" "$tmp/inspect_relocs.txt" || fail "inspect relocation type"
 pass "inspect object"
+
+./kasm examples/hello.asm -o "$tmp/inspect_exec"
+./kasm inspect --segments "$tmp/inspect_exec" > "$tmp/inspect_segments.txt"
+grep -q "Program Headers:" "$tmp/inspect_segments.txt" || fail "inspect executable segments"
+grep -q "LOAD.*R-X" "$tmp/inspect_segments.txt" || fail "inspect executable text segment"
+./kasm inspect --all "$tmp/inspect_exec" > "$tmp/inspect_all_exec.txt"
+grep -q "ELF Header:" "$tmp/inspect_all_exec.txt" || fail "inspect all executable header"
+grep -q "Program Headers:" "$tmp/inspect_all_exec.txt" || fail "inspect all executable segments"
+pass "inspect executable"
+
+./kasm disasm "$tmp/inspect_exec" > "$tmp/disasm_hello.txt"
+grep -q "mov rax, 1" "$tmp/disasm_hello.txt" || fail "disasm hello mov"
+grep -q "lea rsi, \\[rel" "$tmp/disasm_hello.txt" || fail "disasm hello lea"
+grep -q "syscall" "$tmp/disasm_hello.txt" || fail "disasm hello syscall"
+./kasm disasm --section .text "$tmp/inspect_exec" > "$tmp/disasm_text.txt"
+grep -q "ret\\|syscall\\|mov" "$tmp/disasm_text.txt" || fail "disasm section text"
+pass "disasm hello"
+
+cat > "$tmp/disasm_unknown.asm" <<'ASM'
+entry _start
+section .text
+_start:
+    db 255
+ASM
+./kasm "$tmp/disasm_unknown.asm" -o "$tmp/disasm_unknown"
+./kasm disasm "$tmp/disasm_unknown" > "$tmp/disasm_unknown.txt"
+grep -q "db 0xff" "$tmp/disasm_unknown.txt" || fail "disasm unknown byte"
+printf '\177ELF\002\001' > "$tmp/truncated_elf"
+if ./kasm disasm "$tmp/truncated_elf" > "$tmp/truncated_disasm.out" 2> "$tmp/truncated_disasm.err"; then
+    fail "truncated disasm should fail"
+fi
+grep -q "too small\\|malformed\\|unsupported" "$tmp/truncated_disasm.err" || fail "truncated disasm diagnostic"
+printf 'not-elf-not-elf-not-elf-not-elf-not-elf-not-elf-not-elf-not-elf-not-elf' > "$tmp/not_elf"
+if ./kasm inspect "$tmp/not_elf" > "$tmp/not_elf.out" 2> "$tmp/not_elf.err"; then
+    fail "non-ELF inspect should fail"
+fi
+grep -q "not an ELF file" "$tmp/not_elf.err" || fail "non-ELF inspect diagnostic"
+pass "disasm robustness"
 
 cat > "$tmp/direct_extern.asm" <<'ASM'
 entry _start

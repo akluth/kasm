@@ -66,10 +66,18 @@ static int opcode_imm_size(Statement *st, uint8_t op1, uint8_t op2, int two_byte
 {
     (void)op2;
     (void)two_byte;
+    if (op1 == 0x6a)
+        return 1;
     if (op1 == 0x68)
         return 4;
     if (op1 >= 0xb8 && op1 <= 0xbf)
-        return 8;
+        return st->op && strcmp(st->op, "mov") == 0 &&
+               st->operand_count > 0 && st->operands[0].text[0] == 'e' ? 4 : 8;
+    if (op1 == 0x05 || op1 == 0x0d || op1 == 0x25 ||
+        op1 == 0x2d || op1 == 0x35 || op1 == 0x3d)
+        return 4;
+    if (has_modrm_byte && op1 == 0x83)
+        return 1;
     if (has_modrm_byte && (op1 == 0x81 || op1 == 0xc7))
         return 4;
     if (has_modrm_byte && op1 == 0xf7 && st->op && strcmp(st->op, "test") == 0)
@@ -101,7 +109,9 @@ static const char *friendly_note(Statement *st, const char *why)
     if (strcmp(st->op, "test") == 0)
         return "bitwise-test operands by setting flags without storing a result";
     if (st->op[0] == 'j')
-        return "near branch using a signed 32-bit displacement";
+        return strstr(why, "tiny: selected short") ?
+            "tiny mode selected a signed 8-bit branch displacement" :
+            "near branch using a signed 32-bit displacement";
     if (strcmp(st->op, "call") == 0)
         return "near call using a signed 32-bit displacement";
     if (strcmp(st->op, "push") == 0 || strcmp(st->op, "pop") == 0)
@@ -183,12 +193,14 @@ static void deluxe_bytes(Assembler *as, Statement *st, const uint8_t *bytes, siz
         unsigned mod = (m >> 6) & 3;
         unsigned reg = (m >> 3) & 7;
         unsigned rm = m & 7;
+        int sib_base = -1;
         fprintf(out, "  ModRM: 0x%02x\n", m);
         fprintf(out, "    mod bits: %u\n", mod);
         fprintf(out, "    reg/opcode bits: %u\n", reg);
         fprintf(out, "    r/m bits: %u\n", rm);
         if (mod != 3 && rm == 4 && i < len) {
             uint8_t s = bytes[i++];
+            sib_base = s & 7;
             fprintf(out, "  SIB: 0x%02x\n", s);
             fprintf(out, "    scale: %u\n", 1u << ((s >> 6) & 3));
             fprintf(out, "    index: %u\n", (s >> 3) & 7);
@@ -196,7 +208,19 @@ static void deluxe_bytes(Assembler *as, Statement *st, const uint8_t *bytes, siz
         } else {
             fprintf(out, "  SIB: none\n");
         }
-        if (mod != 3 && i + 4 <= len) {
+        int disp_size = 0;
+        if (mod == 1)
+            disp_size = 1;
+        else if (mod == 2 || (mod == 0 && rm == 5) ||
+                 (mod == 0 && rm == 4 && sib_base == 5))
+            disp_size = 4;
+        if (disp_size == 1 && i < len) {
+            int8_t disp = (int8_t)bytes[i];
+            fprintf(out, "  displacement: size=8 value=%d bytes=", disp);
+            print_lower_bytes(out, bytes + i, 1);
+            fprintf(out, "\n");
+            i += 1;
+        } else if (disp_size == 4 && i + 4 <= len) {
             int32_t disp = (int32_t)read_u32_le(bytes + i);
             fprintf(out, "  displacement: size=32 value=%d bytes=", disp);
             print_lower_bytes(out, bytes + i, 4);
@@ -208,7 +232,13 @@ static void deluxe_bytes(Assembler *as, Statement *st, const uint8_t *bytes, siz
     } else {
         fprintf(out, "  ModRM: none\n");
         fprintf(out, "  SIB: none\n");
-        if ((op1 == 0xe8 || op1 == 0xe9 || (two_byte && op2 >= 0x80 && op2 <= 0x8f)) &&
+        if ((op1 == 0xeb || (op1 >= 0x70 && op1 <= 0x7f)) && i < len) {
+            int8_t disp = (int8_t)bytes[i];
+            fprintf(out, "  displacement: size=8 value=%d bytes=", disp);
+            print_lower_bytes(out, bytes + i, 1);
+            fprintf(out, "\n");
+            i += 1;
+        } else if ((op1 == 0xe8 || op1 == 0xe9 || (two_byte && op2 >= 0x80 && op2 <= 0x8f)) &&
             i + 4 <= len) {
             int32_t disp = (int32_t)read_u32_le(bytes + i);
             fprintf(out, "  displacement: size=32 value=%d bytes=", disp);

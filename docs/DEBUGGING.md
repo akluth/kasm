@@ -1,6 +1,6 @@
 # Debugging and Introspection
 
-KASM v2.0 includes stable text dumps for understanding what an assembly unit produced.
+KASM includes stable text dumps for understanding what an assembly unit produced.
 
 ## Assembly Dumps
 
@@ -32,16 +32,22 @@ The dump tables use tab-separated columns and stable headings so tests and scrip
 
 ## Inspecting Object Files
 
-`kasm inspect` reads ELF64 relocatable object files:
+`kasm inspect` reads ELF64 objects and executables:
 
 ```sh
 ./kasm inspect object_start.o
+./kasm inspect --headers object_start.o
 ./kasm inspect object_start.o --symbols
 ./kasm inspect object_start.o --sections
 ./kasm inspect object_start.o --relocs
+./kasm inspect --segments hello
+./kasm disasm hello
 ```
 
-The inspector is intentionally small. It reads section headers, section names, symbol tables, string tables, and RELA relocation sections. It is not a replacement for `readelf` or `objdump`.
+The inspector and disassembler are intentionally small. They read ELF64 headers,
+program headers, section headers, symbol tables, string tables, RELA relocation
+sections, and KASM-supported x86-64 encodings. They are not replacements for
+`readelf` or `objdump`.
 
 ## Project Builds
 
@@ -81,4 +87,4 @@ src/app.asm:9:1: error: macro argument count mismatch for 'print'
 
 ## Limits
 
-KASM v2.0 does not emit DWARF, line tables, or debugger-ready metadata. The debugging functionality is text introspection and ELF64 object inspection groundwork.
+KASM does not emit DWARF, line tables, or debugger-ready metadata. The debugging functionality is text introspection, ELF64 inspection, and lightweight disassembly groundwork.

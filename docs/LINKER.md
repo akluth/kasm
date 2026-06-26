@@ -1,6 +1,6 @@
 # Internal ELF64 Linker
 
-KASM v2.0 includes a minimal built-in linker for KASM-generated ELF64 relocatable object files.
+KASM includes a minimal built-in linker for KASM-generated ELF64 relocatable object files.
 
 ```sh
 ./kasm main.asm util.asm
