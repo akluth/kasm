@@ -1,5 +1,5 @@
-kasm
-kasm.exe
+/kasm
+/kasm.exe
 src/*.o
 hello
 exit
