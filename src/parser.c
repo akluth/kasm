@@ -45,6 +45,22 @@ static int valid_ident(const char *s);
 static char *dup_range(const char *a, const char *b);
 static int first_word(char *s, char **word, char **rest);
 
+static int parser_prefix_ci(const char *s, const char *prefix)
+{
+    while (*prefix) {
+        if (*s == 0)
+            return 0;
+        char a = *s, b = *prefix;
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+        if (a != b)
+            return 0;
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
 static void expanded_add(ExpandedLines *out, const char *text, const char *path, int line)
 {
     if (out->len == out->cap) {
@@ -71,7 +87,8 @@ static int known_word(const char *s)
     const char *words[] = {
         "entry","global","extern","section","db","dw","dd","dq","times","syscall",
         "struct","sizeof","offsetof","align","resb","resw","resd","resq",
-        "mov","lea","xor","cmp","add","sub","and","or","test","inc","dec","neg","not",
+        "bits","org","assert",
+        "mov","lea","lds","les","xchg","in","out","xor","cmp","add","sub","and","or","test","inc","dec","neg","not",
         "push","pop","jmp","call","ret","je","jz","jne","jnz","jg","jge","jl","jle",
         "ja","jae","jb","jbe","include","define","macro","end"
     };
@@ -653,8 +670,7 @@ static int expand_file(Assembler *as, Preproc *pp, const char *path, ExpandedLin
         char *word = NULL, *rest = NULL;
         first_word(s, &word, &rest);
         kasm_lower_ascii(word);
-        if (!in_macro && (word[0] == '%' || strcmp(word, "bits") == 0 ||
-            strcmp(word, "org") == 0 || strcmp(word, "default") == 0)) {
+        if (!in_macro && (word[0] == '%' || strcmp(word, "default") == 0)) {
             kasm_error(as, (SourceLoc){ path, line_no, 1 },
                        "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM syntax", word);
             free(word);
@@ -1144,8 +1160,22 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
 
     char *colon = strchr(s, ':');
     if (colon) {
+        for (char *p = s; p < colon; p++) {
+            if (isspace((unsigned char)*p)) {
+                colon = NULL;
+                break;
+            }
+        }
+    }
+    if (colon) {
         *colon = 0;
         char *name = kasm_trim(s);
+        int is_local_label = name[0] == '.';
+        char full_name[512];
+        if (is_local_label && as->local_label_parent) {
+            snprintf(full_name, sizeof(full_name), "%s%s", as->local_label_parent, name);
+            name = full_name;
+        }
         int col = kasm_column_of(orig, name);
         if (!valid_ident(name)) {
             kasm_error(as, (SourceLoc){ as->path, line_no, col }, "unexpected token '%s'", name);
@@ -1157,6 +1187,10 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
         }
         if (!kasm_symbol_define(as, name, *current, offsets[*current], 0, 0, line_no, col))
             return 0;
+        if (!is_local_label) {
+            free(as->local_label_parent);
+            as->local_label_parent = kasm_xstrdup(name);
+        }
         Statement st;
         memset(&st, 0, sizeof(st));
         st.type = ST_LABEL;
@@ -1173,6 +1207,8 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
     }
 
     char *eq = strchr(s, '=');
+    if (eq && eq > s && (eq[-1] == '<' || eq[-1] == '>' || eq[-1] == '!' || eq[-1] == '='))
+        eq = NULL;
     if (eq) {
         *eq = 0;
         char *name = kasm_trim(s);
@@ -1210,12 +1246,72 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
     int op_col = kasm_column_of(orig, op);
     kasm_lower_ascii(op);
     char *rest = kasm_trim(sp);
-    if (op[0] == '%' || strcmp(op, "bits") == 0 ||
-        strcmp(op, "org") == 0 || strcmp(op, "default") == 0) {
+    if (op[0] == '%' || strcmp(op, "default") == 0) {
         kasm_error(as, (SourceLoc){ as->path, line_no, op_col },
                    "unsupported NASM-style syntax '%s'; see docs/SYNTAX.md for KASM syntax", op);
         free(op);
         return 0;
+    }
+
+    if (strcmp(op, "bits") == 0) {
+        int64_t n = 0;
+        if (!kasm_parse_int(rest, &n) || !(n == 16 || n == 64)) {
+            kasm_error(as, (SourceLoc){ as->path, line_no, op_col }, "bits expects 16 or 64");
+            free(op);
+            return 0;
+        }
+        if (as->cli_bits && as->cli_bits != (int)n) {
+            kasm_error(as, (SourceLoc){ as->path, line_no, op_col },
+                       "source requests %lld-bit mode but command line requests %d-bit mode",
+                       (long long)n, as->cli_bits);
+            free(op);
+            return 0;
+        }
+        as->bits = n == 16 ? KASM_BITS_16 : KASM_BITS_64;
+        as->source_bits = (int)n;
+        if (as->bits == KASM_BITS_16 && *current == SEC_NONE)
+            *current = SEC_TEXT;
+        Statement st;
+        memset(&st, 0, sizeof(st));
+        st.type = ST_SECTION;
+        st.section = *current;
+        st.line = line_no;
+        st.column = op_col;
+        st.source = kasm_xstrdup(orig);
+        st.name = kasm_xstrdup("bits");
+        add_stmt(as, st);
+        free(op);
+        return 1;
+    }
+
+    if (strcmp(op, "org") == 0) {
+        int64_t n = 0;
+        if (as->origin_set) {
+            kasm_error(as, (SourceLoc){ as->path, line_no, op_col }, "multiple org directives are not supported");
+            free(op);
+            return 0;
+        }
+        if (!kasm_eval_expr(as, rest, *current, *current == SEC_NONE ? 0 : offsets[*current], 0, &n,
+                            (SourceLoc){ as->path, line_no, kasm_column_of(orig, rest) }) || n < 0) {
+            free(op);
+            return 0;
+        }
+        if (*current == SEC_NONE)
+            *current = SEC_TEXT;
+        as->origin = (uint64_t)n;
+        as->origin_set = 1;
+        as->sections[*current].vaddr = as->origin;
+        Statement st;
+        memset(&st, 0, sizeof(st));
+        st.type = ST_SECTION;
+        st.section = *current;
+        st.line = line_no;
+        st.column = op_col;
+        st.source = kasm_xstrdup(orig);
+        st.name = kasm_xstrdup("org");
+        add_stmt(as, st);
+        free(op);
+        return 1;
     }
 
     if (strcmp(op, "entry") == 0) {
@@ -1291,6 +1387,34 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
         return 0;
     }
 
+    if (strcmp(op, "assert") == 0) {
+        char *comma = strchr(rest, ',');
+        if (comma)
+            *comma = 0;
+        char *expr = kasm_trim(rest);
+        char *le = strstr(expr, "<=");
+        int ok = 0;
+        if (le) {
+            *le = 0;
+            int64_t a = 0, b = 0;
+            ok = kasm_eval_expr(as, expr, *current, offsets[*current], 0, &a,
+                                (SourceLoc){ as->path, line_no, op_col }) &&
+                 kasm_eval_expr(as, le + 2, *current, offsets[*current], 0, &b,
+                                (SourceLoc){ as->path, line_no, op_col }) && a <= b;
+        } else {
+            int64_t v = 0;
+            ok = kasm_eval_expr(as, expr, *current, offsets[*current], 0, &v,
+                                (SourceLoc){ as->path, line_no, op_col }) && v != 0;
+        }
+        if (!ok) {
+            kasm_error(as, (SourceLoc){ as->path, line_no, op_col }, "assertion failed");
+            free(op);
+            return 0;
+        }
+        free(op);
+        return 1;
+    }
+
     Statement st;
     memset(&st, 0, sizeof(st));
     st.line = line_no;
@@ -1300,6 +1424,15 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
     st.source = kasm_xstrdup(orig);
     st.op = op;
     st.operand_count = split_operands(rest, st.operands, orig);
+    for (int oi = 0; oi < st.operand_count; oi++) {
+        char *ot = kasm_trim(st.operands[oi].text);
+        if (ot[0] == '.' && as->local_label_parent && valid_ident(ot)) {
+            char full[512];
+            snprintf(full, sizeof(full), "%s%s", as->local_label_parent, ot);
+            free(st.operands[oi].text);
+            st.operands[oi].text = kasm_xstrdup(full);
+        }
+    }
 
     if (strcmp(op, "times") == 0) {
         if (st.operand_count != 1) {
@@ -1307,8 +1440,25 @@ static int parse_line(Assembler *as, char *line, const char *orig, int line_no,
             goto bad;
         }
         char *body = st.operands[0].text;
-        char *p = body;
-        while (*p && !isspace((unsigned char)*p)) p++;
+        char *p = NULL;
+        int depth = 0, in_string = 0;
+        for (char *scan = body; *scan; scan++) {
+            if (*scan == '"') in_string = !in_string;
+            if (!in_string && *scan == '(') depth++;
+            if (!in_string && *scan == ')' && depth) depth--;
+            if (!in_string && depth == 0 &&
+                (scan == body || isspace((unsigned char)scan[-1])) &&
+                (parser_prefix_ci(scan, "db") || parser_prefix_ci(scan, "dw") ||
+                 parser_prefix_ci(scan, "dd") || parser_prefix_ci(scan, "dq")) &&
+                (scan[2] == 0 || isspace((unsigned char)scan[2]))) {
+                p = scan;
+                break;
+            }
+        }
+        if (!p) {
+            kasm_error(as, (SourceLoc){ as->path, line_no, op_col }, "invalid operand combination: times expects '<count> db ...'");
+            goto bad;
+        }
         char *count_s = dup_range(body, p);
         char *count_keep = kasm_xstrdup(count_s);
         int64_t count = 0;

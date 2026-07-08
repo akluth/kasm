@@ -16,6 +16,7 @@ Build examples from the repository root unless noted.
 | `09_struct_binary_header.asm` | struct binary layout and raw output | `./kasm examples/09_struct_binary_header.asm -f bin -o header.bin` |
 | `data_struct_layout.asm` | struct layout release-pack example | `./kasm examples/data_struct_layout.asm -f bin -o header.bin` |
 | `10_explain_demo.asm` | verbose explain, map, and listing modes | `./kasm examples/10_explain_demo.asm -o explain --explain=verbose` |
+| `doslike/int21_kernel.asm` | tiny DOS-like INT 21h service skeleton | `./kasm examples/doslike/int21_kernel.asm -f bin16 -o int21_kernel.bin` |
 | `explain_demo.asm` | compact explain demo alias | `./kasm examples/explain_demo.asm -o explain_demo --explain=deluxe` |
 | `hello.asm` | ELF Surgeon Mode | `./kasm --elf-info examples/hello.asm -o hello` |
 | `teach_hello.asm` | guided Teaching Mode | `./kasm --teach examples/teach_hello.asm -o teach_hello` |

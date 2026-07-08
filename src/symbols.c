@@ -196,8 +196,14 @@ static int eval_atom(Assembler *as, const char *atom, SectionId current_section,
     char *tmp = kasm_xstrdup(atom);
     char *s = kasm_trim(tmp);
     int64_t v;
+    if (strcmp(s, "$$") == 0) {
+        uint64_t base = current_section != SEC_NONE ? as->sections[current_section].vaddr : 0;
+        *out = (int64_t)base;
+        free(tmp);
+        return 1;
+    }
     if (strcmp(s, "$") == 0) {
-        uint64_t base = want_absolute && current_section != SEC_NONE ?
+        uint64_t base = (want_absolute || as->bits == KASM_BITS_16) && current_section != SEC_NONE ?
                             as->sections[current_section].vaddr : 0;
         *out = (int64_t)(base + current_offset);
         free(tmp);
@@ -248,12 +254,31 @@ int kasm_eval_expr(Assembler *as, const char *expr, SectionId current_section,
 {
     char *tmp = kasm_xstrdup(expr);
     char *s = kasm_trim(tmp);
+    while (*s == '(') {
+        size_t n = strlen(s);
+        int depth = 0, wraps = n > 1 && s[n - 1] == ')';
+        for (size_t i = 0; i < n && wraps; i++) {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')') depth--;
+            if (depth == 0 && i + 1 < n)
+                wraps = 0;
+        }
+        if (!wraps)
+            break;
+        s[n - 1] = 0;
+        s = kasm_trim(s + 1);
+    }
     int in_string = 0;
     char *op = NULL;
+    int depth = 0;
     for (char *p = s; *p; p++) {
         if (*p == '"')
             in_string = !in_string;
-        if (!in_string && p != s && (*p == '+' || *p == '-')) {
+        if (!in_string && *p == '(')
+            depth++;
+        else if (!in_string && *p == ')' && depth)
+            depth--;
+        if (!in_string && depth == 0 && p != s && (*p == '+' || *p == '-')) {
             op = p;
             break;
         }
@@ -262,8 +287,8 @@ int kasm_eval_expr(Assembler *as, const char *expr, SectionId current_section,
         char kind = *op;
         *op = 0;
         int64_t a, b;
-        int ok = eval_atom(as, s, current_section, current_offset, want_absolute, &a, loc) &&
-                 eval_atom(as, op + 1, current_section, current_offset, want_absolute, &b, loc);
+        int ok = kasm_eval_expr(as, s, current_section, current_offset, want_absolute, &a, loc) &&
+                 kasm_eval_expr(as, op + 1, current_section, current_offset, want_absolute, &b, loc);
         if (ok)
             *out = kind == '+' ? a + b : a - b;
         free(tmp);

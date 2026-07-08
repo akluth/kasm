@@ -187,6 +187,7 @@ void kasm_assembler_free(Assembler *as)
         free(as->source_lines[i]);
     free(as->source_lines);
     free(as->entry);
+    free(as->local_label_parent);
 }
 
 StructDef *kasm_struct_find(Assembler *as, const char *name)
@@ -244,7 +245,7 @@ void kasm_add_reloc(Assembler *as, SectionId section, uint64_t offset,
 
 static void usage(FILE *out)
 {
-    fprintf(out, "KASM 0.1.0\n");
+    fprintf(out, "KASM 0.2.1\n");
     fprintf(out, "usage: kasm [options] input.asm\n");
     fprintf(out, "       kasm build [--config FILE] [--verbose] [--no-link]\n");
     fprintf(out, "       kasm link file.o... -o app [--entry SYMBOL]\n");
@@ -252,7 +253,10 @@ static void usage(FILE *out)
     fprintf(out, "       kasm disasm [--section NAME] [--start ADDR] [--length N] file\n\n");
     fprintf(out, "output:\n");
     fprintf(out, "  -o FILE           write output file\n");
-    fprintf(out, "  -f elf64|elf64-obj|obj|bin  output format, default elf64\n");
+    fprintf(out, "  -f elf64|elf64-obj|obj|bin|bin16  output format, default elf64\n");
+    fprintf(out, "  --arch x86        select x86 target architecture\n");
+    fprintf(out, "  --bits 16|64      select target bitness\n");
+    fprintf(out, "  --cpu 8086|186|286  select 16-bit CPU profile\n");
     fprintf(out, "  --combine         reserved for future multi-file combining\n");
     fprintf(out, "  --tiny, -Oz       prefer smaller safe encodings\n");
     fprintf(out, "  --no-tiny         disable tiny mode after an earlier --tiny/-Oz\n");
@@ -428,7 +432,7 @@ static char *default_output_path(const char *input, const char *format, int mult
     size_t stem_len = dot && dot != base ? (size_t)(dot - base) : strlen(base);
     const char *ext = ".o";
     if (!multi_input) {
-        if (strcmp(format, "bin") == 0)
+        if (strcmp(format, "bin") == 0 || strcmp(format, "bin16") == 0)
             ext = ".bin";
         else if (strcmp(format, "elf64") == 0)
             ext = "";
@@ -450,7 +454,8 @@ static int has_output_mode(const Assembler *as)
 static int valid_format(const char *format)
 {
     return strcmp(format, "elf64") == 0 || strcmp(format, "elf64-obj") == 0 ||
-           strcmp(format, "obj") == 0 || strcmp(format, "bin") == 0;
+           strcmp(format, "obj") == 0 || strcmp(format, "bin") == 0 ||
+           strcmp(format, "bin16") == 0;
 }
 
 static void copy_assembler_options(Assembler *dst, const Assembler *src)
@@ -477,6 +482,12 @@ static void copy_assembler_options(Assembler *dst, const Assembler *src)
     dst->print_std_path = src->print_std_path;
     dst->tiny = src->tiny;
     dst->tiny_report = src->tiny_report;
+    dst->bits = src->bits;
+    dst->cpu = src->cpu;
+    dst->cli_bits = src->cli_bits;
+    dst->source_bits = src->source_bits;
+    dst->origin = src->origin;
+    dst->origin_set = src->origin_set;
     dst->hints = src->hints;
     dst->hint_perf = src->hint_perf;
     dst->hint_abi = src->hint_abi;
@@ -492,7 +503,7 @@ static int write_output(Assembler *as, const char *input, const char *output, co
         return kasm_write_elf64(as, output);
     if (strcmp(format, "elf64-obj") == 0 || strcmp(format, "obj") == 0)
         return kasm_write_elf64_obj(as, output);
-    if (strcmp(format, "bin") == 0)
+    if (strcmp(format, "bin") == 0 || strcmp(format, "bin16") == 0)
         return kasm_write_bin(as, output);
     kasm_error(as, (SourceLoc){ input, 1, 1 }, "unknown output format '%s'", format);
     return 0;
@@ -503,10 +514,24 @@ static int assemble_one(const Assembler *options, const char *input,
 {
     Assembler as;
     memset(&as, 0, sizeof(as));
+    as.bits = KASM_BITS_64;
+    as.cpu = KASM_CPU_X86_64;
     copy_assembler_options(&as, options);
     as.path = input;
     as.object_mode = strcmp(format, "elf64-obj") == 0 || strcmp(format, "obj") == 0;
-    as.raw_mode = strcmp(format, "bin") == 0;
+    as.raw_mode = strcmp(format, "bin") == 0 || strcmp(format, "bin16") == 0;
+    if (!as.bits)
+        as.bits = strcmp(format, "bin16") == 0 ? KASM_BITS_16 : KASM_BITS_64;
+    if (!as.cpu)
+        as.cpu = as.bits == KASM_BITS_16 ? KASM_CPU_8086 : KASM_CPU_X86_64;
+    if (strcmp(format, "bin16") == 0) {
+        as.bits = KASM_BITS_16;
+        as.cpu = KASM_CPU_8086;
+    }
+    if (as.bits == KASM_BITS_16 && !as.raw_mode) {
+        kasm_error(&as, (SourceLoc){ input, 1, 1 }, "ELF64 output cannot be combined with --bits 16");
+        goto fail;
+    }
 
     if (as.explain_path) {
         as.explain_file = fopen(as.explain_path, "wb");
@@ -526,7 +551,7 @@ static int assemble_one(const Assembler *options, const char *input,
     if (!kasm_parse_file(&as, input) || as.errors)
         goto fail;
     as.object_mode = strcmp(format, "elf64-obj") == 0 || strcmp(format, "obj") == 0;
-    as.raw_mode = strcmp(format, "bin") == 0;
+    as.raw_mode = strcmp(format, "bin") == 0 || strcmp(format, "bin16") == 0;
     if (!kasm_validate_symbols(&as, as.object_mode) || as.errors)
         goto fail;
     if (!kasm_apply_tiny_layout(&as) || as.errors)
@@ -3172,6 +3197,55 @@ int main(int argc, char **argv)
                 return 2;
             format = argv[++i];
             format_set = 1;
+            if (strcmp(format, "bin16") == 0) {
+                as.bits = KASM_BITS_16;
+                as.cpu = KASM_CPU_8086;
+                as.cli_bits = 16;
+            }
+        } else if (strcmp(argv[i], "--arch") == 0) {
+            if (!require_arg(argc, argv, i))
+                return 2;
+            const char *arch = argv[++i];
+            if (strcmp(arch, "x86") != 0) {
+                fprintf(stderr, "error: unsupported architecture '%s'\n", arch);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--bits") == 0) {
+            if (!require_arg(argc, argv, i))
+                return 2;
+            const char *bits = argv[++i];
+            if (strcmp(bits, "16") == 0) {
+                as.bits = KASM_BITS_16;
+                as.cpu = KASM_CPU_8086;
+                as.cli_bits = 16;
+            } else if (strcmp(bits, "64") == 0) {
+                as.bits = KASM_BITS_64;
+                as.cpu = KASM_CPU_X86_64;
+                as.cli_bits = 64;
+            } else {
+                fprintf(stderr, "error: --bits expects 16 or 64\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            if (!require_arg(argc, argv, i))
+                return 2;
+            const char *cpu = argv[++i];
+            if (strcmp(cpu, "8086") == 0) {
+                as.cpu = KASM_CPU_8086;
+                as.bits = KASM_BITS_16;
+                if (!as.cli_bits) as.cli_bits = 16;
+            } else if (strcmp(cpu, "186") == 0 || strcmp(cpu, "80186") == 0) {
+                as.cpu = KASM_CPU_80186;
+                as.bits = KASM_BITS_16;
+                if (!as.cli_bits) as.cli_bits = 16;
+            } else if (strcmp(cpu, "286") == 0 || strcmp(cpu, "80286") == 0) {
+                as.cpu = KASM_CPU_80286;
+                as.bits = KASM_BITS_16;
+                if (!as.cli_bits) as.cli_bits = 16;
+            } else {
+                fprintf(stderr, "error: unsupported CPU '%s'\n", cpu);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--tiny") == 0 || strcmp(argv[i], "-Oz") == 0) {
             as.tiny = 1;
         } else if (strcmp(argv[i], "--no-tiny") == 0) {
@@ -3209,7 +3283,7 @@ int main(int argc, char **argv)
             const char *fmt = argv[++i];
             if (strcmp(fmt, "text") != 0) {
                 fprintf(stderr, "error: unsupported explain format '%s'\n", fmt);
-                fprintf(stderr, "hint: KASM 0.1.0 supports --explain-format text\n");
+                fprintf(stderr, "hint: KASM 0.2.1 supports --explain-format text\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--explain-file") == 0) {
@@ -3296,7 +3370,7 @@ int main(int argc, char **argv)
                 return 2;
             }
         } else if (strcmp(argv[i], "--version") == 0) {
-            puts("KASM 0.1.0");
+            puts("KASM 0.2.1");
             return 0;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(stdout);
@@ -3329,6 +3403,12 @@ int main(int argc, char **argv)
     }
     if (!valid_format(format)) {
         fprintf(stderr, "error: unknown output format '%s'\n", format);
+        free(inputs);
+        kasm_assembler_free(&as);
+        return 2;
+    }
+    if (as.bits == KASM_BITS_16 && strcmp(format, "bin") != 0 && strcmp(format, "bin16") != 0) {
+        fprintf(stderr, "error: ELF64 output cannot be combined with --bits 16\n");
         free(inputs);
         kasm_assembler_free(&as);
         return 2;

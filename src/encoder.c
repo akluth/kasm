@@ -23,7 +23,8 @@ static const Reg regs[] = {
     { "esp", 4, 32 }, { "ebp", 5, 32 }, { "esi", 6, 32 }, { "edi", 7, 32 },
     { "ax", 0, 16 }, { "cx", 1, 16 }, { "dx", 2, 16 }, { "bx", 3, 16 },
     { "sp", 4, 16 }, { "bp", 5, 16 }, { "si", 6, 16 }, { "di", 7, 16 },
-    { "al", 0, 8 }, { "cl", 1, 8 }, { "dl", 2, 8 }, { "bl", 3, 8 }
+    { "al", 0, 8 }, { "cl", 1, 8 }, { "dl", 2, 8 }, { "bl", 3, 8 },
+    { "ah", 4, 8 }, { "ch", 5, 8 }, { "dh", 6, 8 }, { "bh", 7, 8 }
 };
 
 static int reg_code(const char *name, int *code, int *bits)
@@ -52,6 +53,15 @@ static void rex(ByteBuf *b, int w, int r, int x, int m)
 static void modrm(ByteBuf *b, int mod, int reg, int rm)
 {
     kasm_buf_append_u8(b, (uint8_t)((mod << 6) | ((reg & 7) << 3) | (rm & 7)));
+}
+
+static int segreg_code(const char *name, int *code)
+{
+    if (kasm_streq_ci(name, "es")) { *code = 0; return 1; }
+    if (kasm_streq_ci(name, "cs")) { *code = 1; return 1; }
+    if (kasm_streq_ci(name, "ss")) { *code = 2; return 1; }
+    if (kasm_streq_ci(name, "ds")) { *code = 3; return 1; }
+    return 0;
 }
 
 static int is_i32(int64_t v)
@@ -266,6 +276,149 @@ static int mem_disp_size(const MemOp *mem, int tiny)
     if (is_i8(mem->disp))
         return 1;
     return 4;
+}
+
+typedef struct {
+    int is_mem;
+    int size_bits;
+    int rm;
+    int mod;
+    int disp_size;
+    int64_t disp;
+    char symbol[256];
+    int has_symbol;
+    int segreg;
+    int has_segreg;
+} Mem16;
+
+static int parse_size_prefix(char **s, int *size_bits)
+{
+    if (prefix_ci(*s, "word ptr")) { *size_bits = 16; *s = kasm_trim(*s + 8); return 1; }
+    if (prefix_ci(*s, "byte ptr")) { *size_bits = 8; *s = kasm_trim(*s + 8); return 1; }
+    if (prefix_ci(*s, "word")) { *size_bits = 16; *s = kasm_trim(*s + 4); return 1; }
+    if (prefix_ci(*s, "byte")) { *size_bits = 8; *s = kasm_trim(*s + 4); return 1; }
+    return 0;
+}
+
+static int parse_mem16(Assembler *as, const char *text, SourceLoc loc, Mem16 *m)
+{
+    memset(m, 0, sizeof(*m));
+    m->rm = -1;
+    m->segreg = -1;
+    char *tmp = kasm_xstrdup(text);
+    char *s = kasm_trim(tmp);
+    parse_size_prefix(&s, &m->size_bits);
+    size_t n = strlen(s);
+    if (n < 2 || s[0] != '[' || s[n - 1] != ']') {
+        free(tmp);
+        return 0;
+    }
+    s[n - 1] = 0;
+    char *inside = kasm_trim(s + 1);
+    char *colon = strchr(inside, ':');
+    if (colon) {
+        *colon = 0;
+        if (!segreg_code(kasm_trim(inside), &m->segreg)) {
+            kasm_error(as, loc, "invalid segment override '%s'", inside);
+            free(tmp);
+            return -1;
+        }
+        m->has_segreg = 1;
+        inside = kasm_trim(colon + 1);
+    }
+    char normalized[512];
+    size_t j = 0;
+    for (char *p = inside; *p && j + 2 < sizeof(normalized); p++) {
+        if (*p == '-') { normalized[j++] = '+'; normalized[j++] = '-'; }
+        else if (*p != ' ' && *p != '\t') normalized[j++] = *p;
+    }
+    normalized[j] = 0;
+    int has_bx = 0, has_bp = 0, has_si = 0, has_di = 0, regs_seen = 0;
+    char *term = strtok(normalized, "+");
+    while (term) {
+        if (*term == 0) {
+            term = strtok(NULL, "+");
+            continue;
+        }
+        int code, bits;
+        if (reg_code(term, &code, &bits)) {
+            if (bits != 16 || !(code == 3 || code == 5 || code == 6 || code == 7)) {
+                kasm_error(as, loc, "invalid 8086 effective address '%s'; hint: valid bases are BX, BP, SI and DI in supported combinations", text);
+                free(tmp);
+                return -1;
+            }
+            has_bx |= code == 3; has_bp |= code == 5; has_si |= code == 6; has_di |= code == 7;
+            regs_seen++;
+        } else {
+            int64_t v = 0;
+            if (kasm_parse_int(term, &v)) {
+                m->disp += v;
+            } else {
+                if (m->has_symbol) {
+                    kasm_error(as, loc, "invalid 8086 effective address '%s'", text);
+                    free(tmp);
+                    return -1;
+                }
+                snprintf(m->symbol, sizeof(m->symbol), "%s", term);
+                m->has_symbol = 1;
+            }
+        }
+        term = strtok(NULL, "+");
+    }
+    if (regs_seen == 0) {
+        m->mod = 0; m->rm = 6; m->disp_size = 2; m->is_mem = 1;
+        free(tmp);
+        return 1;
+    }
+    if (has_bx && has_si && regs_seen == 2) m->rm = 0;
+    else if (has_bx && has_di && regs_seen == 2) m->rm = 1;
+    else if (has_bp && has_si && regs_seen == 2) m->rm = 2;
+    else if (has_bp && has_di && regs_seen == 2) m->rm = 3;
+    else if (has_si && regs_seen == 1) m->rm = 4;
+    else if (has_di && regs_seen == 1) m->rm = 5;
+    else if (has_bp && regs_seen == 1) m->rm = 6;
+    else if (has_bx && regs_seen == 1) m->rm = 7;
+    else {
+        kasm_error(as, loc, "invalid 8086 effective address '%s'; hint: valid forms include [BX+SI], [BX+DI], [BP+SI], [BP+DI], [SI], [DI], [BP] and [BX]", text);
+        free(tmp);
+        return -1;
+    }
+    if (m->has_symbol || m->disp < INT8_MIN || m->disp > INT8_MAX) {
+        m->mod = 2; m->disp_size = 2;
+    } else if (m->disp != 0 || m->rm == 6) {
+        m->mod = 1; m->disp_size = 1;
+    } else {
+        m->mod = 0; m->disp_size = 0;
+    }
+    m->is_mem = 1;
+    free(tmp);
+    return 1;
+}
+
+static void emit_mem16_prefix(ByteBuf *out, Mem16 *m)
+{
+    if (m->has_segreg) {
+        static const uint8_t pfx[] = { 0x26, 0x2E, 0x36, 0x3E };
+        kasm_buf_append_u8(out, pfx[m->segreg]);
+    }
+}
+
+static void emit_mem16_addr(Assembler *as, Statement *st, ByteBuf *out, Mem16 *m, int reg, int dry)
+{
+    modrm(out, m->mod, reg, m->rm);
+    if (m->disp_size == 1) {
+        kasm_buf_append_u8(out, (uint8_t)(int8_t)m->disp);
+    } else if (m->disp_size == 2) {
+        int64_t v = m->disp;
+        if (m->has_symbol && !dry) {
+            if (!kasm_eval_expr(as, m->symbol, st->section, st->offset, 1, &v,
+                                (SourceLoc){ as->path, st->line, st->column }))
+                v = 0;
+        } else if (m->has_symbol) {
+            v = 0;
+        }
+        kasm_buf_append_u16(out, (uint16_t)v);
+    }
 }
 
 static int emit_modrm_mem(ByteBuf *out, int reg_field, const MemOp *mem, int tiny)
@@ -786,10 +939,618 @@ int kasm_apply_tiny_layout(Assembler *as)
     return as->errors == 0;
 }
 
+static int jcc16_opcode(const char *op)
+{
+    if (strcmp(op, "jo") == 0) return 0x70;
+    if (strcmp(op, "jno") == 0) return 0x71;
+    if (strcmp(op, "jc") == 0 || strcmp(op, "jb") == 0 || strcmp(op, "jnae") == 0) return 0x72;
+    if (strcmp(op, "jnc") == 0 || strcmp(op, "jae") == 0 || strcmp(op, "jnb") == 0) return 0x73;
+    if (strcmp(op, "je") == 0 || strcmp(op, "jz") == 0) return 0x74;
+    if (strcmp(op, "jne") == 0 || strcmp(op, "jnz") == 0) return 0x75;
+    if (strcmp(op, "jbe") == 0 || strcmp(op, "jna") == 0) return 0x76;
+    if (strcmp(op, "ja") == 0 || strcmp(op, "jnbe") == 0) return 0x77;
+    if (strcmp(op, "js") == 0) return 0x78;
+    if (strcmp(op, "jns") == 0) return 0x79;
+    if (strcmp(op, "jp") == 0 || strcmp(op, "jpe") == 0) return 0x7A;
+    if (strcmp(op, "jnp") == 0 || strcmp(op, "jpo") == 0) return 0x7B;
+    if (strcmp(op, "jl") == 0 || strcmp(op, "jnge") == 0) return 0x7C;
+    if (strcmp(op, "jge") == 0 || strcmp(op, "jnl") == 0) return 0x7D;
+    if (strcmp(op, "jle") == 0 || strcmp(op, "jng") == 0) return 0x7E;
+    if (strcmp(op, "jg") == 0 || strcmp(op, "jnle") == 0) return 0x7F;
+    return -1;
+}
+
+static int one_byte16_opcode(const char *op)
+{
+    if (strcmp(op, "pushf") == 0) return 0x9C;
+    if (strcmp(op, "popf") == 0) return 0x9D;
+    if (strcmp(op, "ret") == 0) return 0xC3;
+    if (strcmp(op, "retf") == 0) return 0xCB;
+    if (strcmp(op, "iret") == 0) return 0xCF;
+    if (strcmp(op, "clc") == 0) return 0xF8;
+    if (strcmp(op, "stc") == 0) return 0xF9;
+    if (strcmp(op, "cli") == 0) return 0xFA;
+    if (strcmp(op, "sti") == 0) return 0xFB;
+    if (strcmp(op, "cld") == 0) return 0xFC;
+    if (strcmp(op, "std") == 0) return 0xFD;
+    if (strcmp(op, "cmc") == 0) return 0xF5;
+    if (strcmp(op, "lahf") == 0) return 0x9F;
+    if (strcmp(op, "sahf") == 0) return 0x9E;
+    if (strcmp(op, "nop") == 0) return 0x90;
+    if (strcmp(op, "hlt") == 0) return 0xF4;
+    if (strcmp(op, "wait") == 0) return 0x9B;
+    if (strcmp(op, "cbw") == 0) return 0x98;
+    if (strcmp(op, "cwd") == 0) return 0x99;
+    if (strcmp(op, "movsb") == 0) return 0xA4;
+    if (strcmp(op, "movsw") == 0) return 0xA5;
+    if (strcmp(op, "cmpsb") == 0) return 0xA6;
+    if (strcmp(op, "cmpsw") == 0) return 0xA7;
+    if (strcmp(op, "stosb") == 0) return 0xAA;
+    if (strcmp(op, "stosw") == 0) return 0xAB;
+    if (strcmp(op, "lodsb") == 0) return 0xAC;
+    if (strcmp(op, "lodsw") == 0) return 0xAD;
+    if (strcmp(op, "scasb") == 0) return 0xAE;
+    if (strcmp(op, "scasw") == 0) return 0xAF;
+    return -1;
+}
+
+static int group1_ext16(const char *op)
+{
+    if (strcmp(op, "add") == 0) return 0;
+    if (strcmp(op, "or") == 0) return 1;
+    if (strcmp(op, "adc") == 0) return 2;
+    if (strcmp(op, "sbb") == 0) return 3;
+    if (strcmp(op, "and") == 0) return 4;
+    if (strcmp(op, "sub") == 0) return 5;
+    if (strcmp(op, "xor") == 0) return 6;
+    if (strcmp(op, "cmp") == 0) return 7;
+    return -1;
+}
+
+static int emit16_eval(Assembler *as, Statement *st, const char *expr, int op_index,
+                       int want_absolute, int dry, int64_t *out)
+{
+    if (dry) {
+        *out = 0;
+        return 1;
+    }
+    return kasm_eval_expr(as, expr, st->section, st->offset, want_absolute, out,
+                          (SourceLoc){ as->path, st->line, st->operands[op_index].column });
+}
+
+static int parse_far16(Assembler *as, Statement *st, const char *text, int op_index,
+                       int dry, uint16_t *seg, uint16_t *off)
+{
+    char *tmp = kasm_xstrdup(text);
+    char *s = kasm_trim(tmp);
+    if (prefix_ci(s, "far"))
+        s = kasm_trim(s + 3);
+    char *colon = strchr(s, ':');
+    if (!colon) {
+        free(tmp);
+        return 0;
+    }
+    *colon = 0;
+    int64_t seg_v = 0, off_v = 0;
+    int ok = emit16_eval(as, st, kasm_trim(s), op_index, 0, dry, &seg_v) &&
+             emit16_eval(as, st, kasm_trim(colon + 1), op_index, 0, dry, &off_v);
+    free(tmp);
+    if (!ok)
+        return -1;
+    if (!dry && (seg_v < 0 || seg_v > 0xFFFF || off_v < 0 || off_v > 0xFFFF)) {
+        kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[op_index].column },
+                   "far pointer components must fit in 16 bits");
+        return -1;
+    }
+    *seg = (uint16_t)seg_v;
+    *off = (uint16_t)off_v;
+    return 1;
+}
+
+static int emit16_mem_group(Assembler *as, Statement *st, ByteBuf *out, const char **why,
+                            const char *op, int dry)
+{
+    int rd = 0, rs = 0, db = 0, sb = 0;
+    int g1 = group1_ext16(op);
+    if (g1 < 0)
+        return 0;
+    Mem16 mem;
+    int dst_mem = parse_mem16(as, st->operands[0].text,
+                              (SourceLoc){ as->path, st->line, st->operands[0].column }, &mem);
+    if (dst_mem < 0)
+        return -1;
+    if (dst_mem) {
+        if (reg_code(st->operands[1].text, &rs, &sb)) {
+            if (sb != 8 && sb != 16)
+                return 0;
+            if (mem.size_bits && mem.size_bits != sb) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column },
+                           "memory operand size does not match register");
+                return -1;
+            }
+            static const uint8_t rm_reg[] = { 0x00,0x08,0x10,0x18,0x20,0x28,0x30,0x38 };
+            emit_mem16_prefix(out, &mem);
+            kasm_buf_append_u8(out, (uint8_t)(rm_reg[g1] + (sb == 16 ? 1 : 0)));
+            emit_mem16_addr(as, st, out, &mem, rs, dry);
+            *why = "8086 ALU memory, register";
+            return 1;
+        }
+        int sz = mem.size_bits;
+        if (!sz) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column },
+                       "ambiguous memory operand size in 16-bit mode; hint: use 'byte [value]' or 'word [value]'");
+            return -1;
+        }
+        int64_t imm = 0;
+        if (!emit16_eval(as, st, st->operands[1].text, 1, 0, dry, &imm))
+            return -1;
+        emit_mem16_prefix(out, &mem);
+        kasm_buf_append_u8(out, sz == 8 ? 0x80 : 0x81);
+        emit_mem16_addr(as, st, out, &mem, g1, dry);
+        if (sz == 8)
+            kasm_buf_append_u8(out, (uint8_t)imm);
+        else
+            kasm_buf_append_u16(out, (uint16_t)imm);
+        *why = "8086 ALU memory, immediate";
+        return 1;
+    }
+    if (reg_code(st->operands[0].text, &rd, &db)) {
+        int src_mem = parse_mem16(as, st->operands[1].text,
+                                  (SourceLoc){ as->path, st->line, st->operands[1].column }, &mem);
+        if (src_mem < 0)
+            return -1;
+        if (src_mem) {
+            if (db != 8 && db != 16)
+                return 0;
+            static const uint8_t reg_rm[] = { 0x02,0x0A,0x12,0x1A,0x22,0x2A,0x32,0x3A };
+            emit_mem16_prefix(out, &mem);
+            kasm_buf_append_u8(out, (uint8_t)(reg_rm[g1] + (db == 16 ? 1 : 0)));
+            emit_mem16_addr(as, st, out, &mem, rd, dry);
+            *why = "8086 ALU register, memory";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int emit16(Assembler *as, Statement *st, ByteBuf *out, const char **why, int dry)
+{
+    const char *op = st->op;
+    int c = st->operand_count;
+    int rd = 0, rs = 0, db = 0, sb = 0, sd = 0, ss = 0;
+    int op1 = one_byte16_opcode(op);
+    if (op1 >= 0 && c == 0) {
+        kasm_buf_append_u8(out, (uint8_t)op1);
+        *why = "8086 one-byte instruction";
+        return 1;
+    }
+    if ((strcmp(op, "rep") == 0 || strcmp(op, "repe") == 0 || strcmp(op, "repz") == 0 ||
+         strcmp(op, "repne") == 0 || strcmp(op, "repnz") == 0) && c == 1) {
+        int inner = one_byte16_opcode(st->operands[0].text);
+        if (inner < 0) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "invalid string instruction after %s", op);
+            return 0;
+        }
+        kasm_buf_append_u8(out, (strcmp(op, "repne") == 0 || strcmp(op, "repnz") == 0) ? 0xF2 : 0xF3);
+        kasm_buf_append_u8(out, (uint8_t)inner);
+        *why = "8086 repeat-prefixed string instruction";
+        return 1;
+    }
+    if (strcmp(op, "int") == 0 && c == 1) {
+        int64_t v;
+        if (!emit16_eval(as, st, st->operands[0].text, 0, 0, dry, &v)) return 0;
+        if (!dry && (v < 0 || v > 255)) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "interrupt vector does not fit in 8 bits");
+            return 0;
+        }
+        kasm_buf_append_u8(out, 0xCD); kasm_buf_append_u8(out, (uint8_t)v);
+        *why = "int imm8";
+        return 1;
+    }
+    if ((strcmp(op, "jmp") == 0 || strcmp(op, "call") == 0) && c == 1) {
+        uint16_t far_seg = 0, far_off = 0;
+        int far = parse_far16(as, st, st->operands[0].text, 0, dry, &far_seg, &far_off);
+        if (far < 0)
+            return 0;
+        if (far) {
+            kasm_buf_append_u8(out, strcmp(op, "jmp") == 0 ? 0xEA : 0x9A);
+            kasm_buf_append_u16(out, far_off);
+            kasm_buf_append_u16(out, far_seg);
+            *why = strcmp(op, "jmp") == 0 ? "8086 far jmp ptr16:16" : "8086 far call ptr16:16";
+            return 1;
+        }
+        int64_t target;
+        if (!emit16_eval(as, st, st->operands[0].text, 0, 1, dry, &target)) return 0;
+        int64_t here = (int64_t)(as->sections[st->section].vaddr + st->offset + 3);
+        kasm_buf_append_u8(out, strcmp(op, "jmp") == 0 ? 0xE9 : 0xE8);
+        kasm_buf_append_u16(out, (uint16_t)(target - here));
+        *why = strcmp(op, "jmp") == 0 ? "8086 near jmp rel16" : "8086 near call rel16";
+        return 1;
+    }
+    int jcc = jcc16_opcode(op);
+    if (jcc >= 0 && c == 1) {
+        int64_t target;
+        if (!emit16_eval(as, st, st->operands[0].text, 0, 1, dry, &target)) return 0;
+        int64_t here = (int64_t)(as->sections[st->section].vaddr + st->offset + 2);
+        int64_t d = target - here;
+        if (!dry && (d < INT8_MIN || d > INT8_MAX)) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "conditional jump target is outside signed 8-bit range");
+            return 0;
+        }
+        kasm_buf_append_u8(out, (uint8_t)jcc); kasm_buf_append_u8(out, (uint8_t)(int8_t)d);
+        *why = "8086 conditional jump rel8";
+        return 1;
+    }
+    if ((strcmp(op, "loop") == 0 || strcmp(op, "loope") == 0 || strcmp(op, "loopz") == 0 ||
+         strcmp(op, "loopne") == 0 || strcmp(op, "loopnz") == 0 || strcmp(op, "jcxz") == 0) && c == 1) {
+        int64_t target;
+        if (!emit16_eval(as, st, st->operands[0].text, 0, 1, dry, &target)) return 0;
+        int opcode = strcmp(op, "loop") == 0 ? 0xE2 :
+                     (strcmp(op, "loope") == 0 || strcmp(op, "loopz") == 0) ? 0xE1 :
+                     (strcmp(op, "jcxz") == 0) ? 0xE3 : 0xE0;
+        int64_t d = target - (int64_t)(as->sections[st->section].vaddr + st->offset + 2);
+        if (!dry && (d < INT8_MIN || d > INT8_MAX)) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "loop target is outside signed 8-bit range");
+            return 0;
+        }
+        kasm_buf_append_u8(out, (uint8_t)opcode); kasm_buf_append_u8(out, (uint8_t)(int8_t)d);
+        *why = "8086 loop/jcxz rel8";
+        return 1;
+    }
+    if ((strcmp(op, "push") == 0 || strcmp(op, "pop") == 0) && c == 1) {
+        if (reg_code(st->operands[0].text, &rd, &db) && db == 16) {
+            kasm_buf_append_u8(out, (uint8_t)((strcmp(op, "push") == 0 ? 0x50 : 0x58) + rd));
+            *why = "8086 push/pop r16";
+            return 1;
+        }
+        if (segreg_code(st->operands[0].text, &sd)) {
+            if (strcmp(op, "push") == 0) kasm_buf_append_u8(out, (uint8_t)(0x06 + (sd << 3)));
+            else kasm_buf_append_u8(out, (uint8_t)(0x07 + (sd << 3)));
+            *why = "8086 push/pop segment";
+            return 1;
+        }
+    }
+    if ((strcmp(op, "in") == 0 || strcmp(op, "out") == 0) && c == 2) {
+        int64_t port = 0;
+        if (strcmp(op, "in") == 0) {
+            if (!reg_code(st->operands[0].text, &rd, &db) || !(rd == 0 && (db == 8 || db == 16))) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "IN destination must be AL or AX");
+                return 0;
+            }
+            if (kasm_streq_ci(st->operands[1].text, "dx")) {
+                kasm_buf_append_u8(out, db == 8 ? 0xEC : 0xED);
+            } else {
+                if (!emit16_eval(as, st, st->operands[1].text, 1, 0, dry, &port)) return 0;
+                if (!dry && (port < 0 || port > 0xFF)) {
+                    kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[1].column }, "I/O port immediate must fit in 8 bits");
+                    return 0;
+                }
+                kasm_buf_append_u8(out, db == 8 ? 0xE4 : 0xE5);
+                kasm_buf_append_u8(out, (uint8_t)port);
+            }
+            *why = "8086 in";
+            return 1;
+        }
+        if (!reg_code(st->operands[1].text, &rs, &sb) || !(rs == 0 && (sb == 8 || sb == 16))) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[1].column }, "OUT source must be AL or AX");
+            return 0;
+        }
+        if (kasm_streq_ci(st->operands[0].text, "dx")) {
+            kasm_buf_append_u8(out, sb == 8 ? 0xEE : 0xEF);
+        } else {
+            if (!emit16_eval(as, st, st->operands[0].text, 0, 0, dry, &port)) return 0;
+            if (!dry && (port < 0 || port > 0xFF)) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "I/O port immediate must fit in 8 bits");
+                return 0;
+            }
+            kasm_buf_append_u8(out, sb == 8 ? 0xE6 : 0xE7);
+            kasm_buf_append_u8(out, (uint8_t)port);
+        }
+        *why = "8086 out";
+        return 1;
+    }
+    if (strcmp(op, "mov") == 0 && c == 2) {
+        if (segreg_code(st->operands[0].text, &sd)) {
+            if (sd == 1) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "MOV CS, ... is not valid on x86");
+                return 0;
+            }
+            if (!reg_code(st->operands[1].text, &rs, &sb) || sb != 16) goto bad_mov;
+            kasm_buf_append_u8(out, 0x8E); modrm(out, 3, sd, rs);
+            *why = "mov segment, r16";
+            return 1;
+        }
+        if (reg_code(st->operands[0].text, &rd, &db) && segreg_code(st->operands[1].text, &ss)) {
+            if (db != 16) goto bad_mov;
+            kasm_buf_append_u8(out, 0x8C); modrm(out, 3, ss, rd);
+            *why = "mov r16, segment";
+            return 1;
+        }
+        Mem16 mem;
+        int dst_mem = parse_mem16(as, st->operands[0].text, (SourceLoc){ as->path, st->line, st->operands[0].column }, &mem);
+        if (dst_mem < 0) return 0;
+        if (dst_mem) {
+            if (segreg_code(st->operands[1].text, &ss)) {
+                if (mem.size_bits && mem.size_bits != 16) {
+                    kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column },
+                               "segment memory moves require word memory operands");
+                    return 0;
+                }
+                emit_mem16_prefix(out, &mem);
+                kasm_buf_append_u8(out, 0x8C);
+                emit_mem16_addr(as, st, out, &mem, ss, dry);
+                *why = "mov r/m16, segment";
+                return 1;
+            }
+            if (reg_code(st->operands[1].text, &rs, &sb)) {
+                if (sb != 8 && sb != 16) goto bad_mov;
+                if (mem.size_bits && mem.size_bits != sb) {
+                    kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "memory operand size does not match register");
+                    return 0;
+                }
+                emit_mem16_prefix(out, &mem);
+                kasm_buf_append_u8(out, (uint8_t)(sb == 8 ? 0x88 : 0x89));
+                emit_mem16_addr(as, st, out, &mem, rs, dry);
+                *why = "mov r/m, r";
+                return 1;
+            }
+            int64_t imm;
+            int sz = mem.size_bits;
+            if (!sz) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "ambiguous memory operand size in 16-bit mode; hint: use 'byte [value]' or 'word [value]'");
+                return 0;
+            }
+            if (!emit16_eval(as, st, st->operands[1].text, 1, sz == 16, dry, &imm)) return 0;
+            emit_mem16_prefix(out, &mem);
+            kasm_buf_append_u8(out, sz == 8 ? 0xC6 : 0xC7);
+            emit_mem16_addr(as, st, out, &mem, 0, dry);
+            if (sz == 8) kasm_buf_append_u8(out, (uint8_t)imm);
+            else kasm_buf_append_u16(out, (uint16_t)imm);
+            *why = "mov r/m, imm";
+            return 1;
+        }
+        if (reg_code(st->operands[0].text, &rd, &db)) {
+            int src_mem = parse_mem16(as, st->operands[1].text, (SourceLoc){ as->path, st->line, st->operands[1].column }, &mem);
+            if (src_mem < 0) return 0;
+            if (src_mem) {
+                if (db != 8 && db != 16) goto bad_mov;
+                emit_mem16_prefix(out, &mem);
+                kasm_buf_append_u8(out, (uint8_t)(db == 8 ? 0x8A : 0x8B));
+                emit_mem16_addr(as, st, out, &mem, rd, dry);
+                *why = "mov r, r/m";
+                return 1;
+            }
+            if (reg_code(st->operands[1].text, &rs, &sb)) {
+                if (db != sb || (db != 8 && db != 16)) goto bad_mov;
+                kasm_buf_append_u8(out, (uint8_t)(db == 8 ? 0x88 : 0x89)); modrm(out, 3, rs, rd);
+                *why = "mov r, r";
+                return 1;
+            }
+            int64_t imm;
+            if (!emit16_eval(as, st, st->operands[1].text, 1, db == 16, dry, &imm)) return 0;
+            if (db != 8 && db != 16) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "register '%s' is unavailable in 16-bit mode", st->operands[0].text);
+                return 0;
+            }
+            kasm_buf_append_u8(out, (uint8_t)((db == 8 ? 0xB0 : 0xB8) + rd));
+            if (db == 8) kasm_buf_append_u8(out, (uint8_t)imm);
+            else kasm_buf_append_u16(out, (uint16_t)imm);
+            *why = db == 8 ? "mov r8, imm8" : "mov r16, imm16";
+            return 1;
+        }
+bad_mov:
+        kasm_error(as, (SourceLoc){ as->path, st->line, st->column }, "invalid operand combination for 'mov' in 16-bit mode");
+        return 0;
+    }
+    if ((strcmp(op, "lea") == 0 || strcmp(op, "lds") == 0 || strcmp(op, "les") == 0) && c == 2) {
+        if (!reg_code(st->operands[0].text, &rd, &db) || db != 16) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "%s destination must be a 16-bit register", op);
+            return 0;
+        }
+        Mem16 mem;
+        int src_mem = parse_mem16(as, st->operands[1].text,
+                                  (SourceLoc){ as->path, st->line, st->operands[1].column }, &mem);
+        if (src_mem <= 0)
+            return 0;
+        emit_mem16_prefix(out, &mem);
+        kasm_buf_append_u8(out, strcmp(op, "lea") == 0 ? 0x8D : strcmp(op, "les") == 0 ? 0xC4 : 0xC5);
+        emit_mem16_addr(as, st, out, &mem, rd, dry);
+        *why = strcmp(op, "lea") == 0 ? "8086 lea r16, m" : "8086 load far pointer";
+        return 1;
+    }
+    if (strcmp(op, "xchg") == 0 && c == 2) {
+        if (!reg_code(st->operands[0].text, &rd, &db) || !reg_code(st->operands[1].text, &rs, &sb) ||
+            db != sb || (db != 8 && db != 16)) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->column }, "XCHG currently supports register/register forms in 16-bit mode");
+            return 0;
+        }
+        if (db == 16 && rd == 0) {
+            kasm_buf_append_u8(out, (uint8_t)(0x90 + rs));
+        } else if (db == 16 && rs == 0) {
+            kasm_buf_append_u8(out, (uint8_t)(0x90 + rd));
+        } else {
+            kasm_buf_append_u8(out, db == 8 ? 0x86 : 0x87);
+            modrm(out, 3, rd, rs);
+        }
+        *why = "8086 xchg register, register";
+        return 1;
+    }
+    int g1 = group1_ext16(op);
+    if (g1 >= 0 && c == 2) {
+        int mem_result = emit16_mem_group(as, st, out, why, op, dry);
+        if (mem_result < 0)
+            return 0;
+        if (mem_result > 0)
+            return 1;
+        if (!reg_code(st->operands[0].text, &rd, &db)) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column }, "invalid destination operand for '%s'", op);
+            return 0;
+        }
+        if (reg_code(st->operands[1].text, &rs, &sb)) {
+            if (db != sb || (db != 8 && db != 16)) return 0;
+            static const uint8_t rm_reg[] = { 0x00,0x08,0x10,0x18,0x20,0x28,0x30,0x38 };
+            kasm_buf_append_u8(out, (uint8_t)(rm_reg[g1] + (db == 16 ? 1 : 0)));
+            modrm(out, 3, rs, rd);
+            *why = "8086 ALU r/m, r";
+            return 1;
+        }
+        int64_t imm;
+        if (!emit16_eval(as, st, st->operands[1].text, 1, 0, dry, &imm)) return 0;
+        if (db != 8 && db != 16) return 0;
+        kasm_buf_append_u8(out, db == 8 ? 0x80 : 0x81);
+        modrm(out, 3, g1, rd);
+        if (db == 8) kasm_buf_append_u8(out, (uint8_t)imm);
+        else kasm_buf_append_u16(out, (uint16_t)imm);
+        *why = "8086 ALU r/m, imm";
+        return 1;
+    }
+    if (strcmp(op, "test") == 0 && c == 2) {
+        Mem16 mem;
+        int dst_mem = parse_mem16(as, st->operands[0].text,
+                                  (SourceLoc){ as->path, st->line, st->operands[0].column }, &mem);
+        if (dst_mem < 0) return 0;
+        if (dst_mem) {
+            if (reg_code(st->operands[1].text, &rs, &sb)) {
+                if (sb != 8 && sb != 16) return 0;
+                emit_mem16_prefix(out, &mem);
+                kasm_buf_append_u8(out, sb == 8 ? 0x84 : 0x85);
+                emit_mem16_addr(as, st, out, &mem, rs, dry);
+                *why = "test memory, register";
+                return 1;
+            }
+            int sz = mem.size_bits;
+            if (!sz) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column },
+                           "ambiguous memory operand size in 16-bit mode; hint: use 'byte [value]' or 'word [value]'");
+                return 0;
+            }
+            int64_t imm = 0;
+            if (!emit16_eval(as, st, st->operands[1].text, 1, 0, dry, &imm)) return 0;
+            emit_mem16_prefix(out, &mem);
+            kasm_buf_append_u8(out, sz == 8 ? 0xF6 : 0xF7);
+            emit_mem16_addr(as, st, out, &mem, 0, dry);
+            if (sz == 8) kasm_buf_append_u8(out, (uint8_t)imm);
+            else kasm_buf_append_u16(out, (uint16_t)imm);
+            *why = "test memory, immediate";
+            return 1;
+        }
+        if (!reg_code(st->operands[0].text, &rd, &db)) return 0;
+        if (reg_code(st->operands[1].text, &rs, &sb)) {
+            if (db != sb || (db != 8 && db != 16)) return 0;
+            kasm_buf_append_u8(out, db == 8 ? 0x84 : 0x85); modrm(out, 3, rs, rd);
+            *why = "test r/m, r";
+            return 1;
+        }
+        int64_t imm;
+        if (!emit16_eval(as, st, st->operands[1].text, 1, 0, dry, &imm)) return 0;
+        kasm_buf_append_u8(out, db == 8 ? 0xF6 : 0xF7); modrm(out, 3, 0, rd);
+        if (db == 8) kasm_buf_append_u8(out, (uint8_t)imm);
+        else kasm_buf_append_u16(out, (uint16_t)imm);
+        *why = "test r/m, imm";
+        return 1;
+    }
+    if ((strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && c == 1 &&
+        reg_code(st->operands[0].text, &rd, &db) && db == 16) {
+        kasm_buf_append_u8(out, (uint8_t)((strcmp(op, "inc") == 0 ? 0x40 : 0x48) + rd));
+        *why = "8086 inc/dec r16";
+        return 1;
+    }
+    if ((strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && c == 1) {
+        Mem16 mem;
+        int dst_mem = parse_mem16(as, st->operands[0].text,
+                                  (SourceLoc){ as->path, st->line, st->operands[0].column }, &mem);
+        if (dst_mem < 0) return 0;
+        if (dst_mem) {
+            int sz = mem.size_bits;
+            if (!sz) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column },
+                           "ambiguous memory operand size in 16-bit mode; hint: use 'byte [value]' or 'word [value]'");
+                return 0;
+            }
+            emit_mem16_prefix(out, &mem);
+            kasm_buf_append_u8(out, sz == 8 ? 0xFE : 0xFF);
+            emit_mem16_addr(as, st, out, &mem, strcmp(op, "inc") == 0 ? 0 : 1, dry);
+            *why = "8086 inc/dec memory";
+            return 1;
+        }
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 ||
+         strcmp(op, "mul") == 0 || strcmp(op, "imul") == 0 ||
+         strcmp(op, "div") == 0 || strcmp(op, "idiv") == 0) && c == 1 &&
+        reg_code(st->operands[0].text, &rd, &db)) {
+        int ext = strcmp(op, "not") == 0 ? 2 : strcmp(op, "neg") == 0 ? 3 :
+                  strcmp(op, "mul") == 0 ? 4 : strcmp(op, "imul") == 0 ? 5 :
+                  strcmp(op, "div") == 0 ? 6 : 7;
+        kasm_buf_append_u8(out, db == 8 ? 0xF6 : 0xF7); modrm(out, 3, ext, rd);
+        *why = "8086 group unary";
+        return 1;
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 ||
+         strcmp(op, "mul") == 0 || strcmp(op, "imul") == 0 ||
+         strcmp(op, "div") == 0 || strcmp(op, "idiv") == 0) && c == 1) {
+        Mem16 mem;
+        int dst_mem = parse_mem16(as, st->operands[0].text,
+                                  (SourceLoc){ as->path, st->line, st->operands[0].column }, &mem);
+        if (dst_mem < 0) return 0;
+        if (dst_mem) {
+            int sz = mem.size_bits;
+            if (!sz) {
+                kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[0].column },
+                           "ambiguous memory operand size in 16-bit mode; hint: use 'byte [value]' or 'word [value]'");
+                return 0;
+            }
+            int ext = strcmp(op, "not") == 0 ? 2 : strcmp(op, "neg") == 0 ? 3 :
+                      strcmp(op, "mul") == 0 ? 4 : strcmp(op, "imul") == 0 ? 5 :
+                      strcmp(op, "div") == 0 ? 6 : 7;
+            emit_mem16_prefix(out, &mem);
+            kasm_buf_append_u8(out, sz == 8 ? 0xF6 : 0xF7);
+            emit_mem16_addr(as, st, out, &mem, ext, dry);
+            *why = "8086 unary memory";
+            return 1;
+        }
+    }
+    if ((strcmp(op, "shl") == 0 || strcmp(op, "sal") == 0 || strcmp(op, "shr") == 0 ||
+         strcmp(op, "sar") == 0 || strcmp(op, "rol") == 0 || strcmp(op, "ror") == 0 ||
+         strcmp(op, "rcl") == 0 || strcmp(op, "rcr") == 0) && c == 2 &&
+        reg_code(st->operands[0].text, &rd, &db)) {
+        int ext = (strcmp(op, "rol") == 0) ? 0 : (strcmp(op, "ror") == 0) ? 1 :
+                  (strcmp(op, "rcl") == 0) ? 2 : (strcmp(op, "rcr") == 0) ? 3 :
+                  (strcmp(op, "shl") == 0 || strcmp(op, "sal") == 0) ? 4 :
+                  (strcmp(op, "shr") == 0) ? 5 : 7;
+        int by_cl = kasm_streq_ci(st->operands[1].text, "cl");
+        if (!by_cl && strcmp(st->operands[1].text, "1") != 0) {
+            kasm_error(as, (SourceLoc){ as->path, st->line, st->operands[1].column }, "instruction requires 80186 but target CPU is 8086");
+            return 0;
+        }
+        kasm_buf_append_u8(out, (uint8_t)((by_cl ? 0xD2 : 0xD0) + (db == 16 ? 1 : 0)));
+        modrm(out, 3, ext, rd);
+        *why = "8086 shift/rotate";
+        return 1;
+    }
+    kasm_error(as, (SourceLoc){ as->path, st->line, st->column }, "unknown or unsupported 16-bit instruction '%s'", op);
+    return 0;
+}
+
+static int estimate16(Assembler *as, Statement *st)
+{
+    ByteBuf b = { 0 };
+    const char *why = "";
+    int before = as->errors;
+    int ok = emit16(as, st, &b, &why, 1);
+    if (ok)
+        st->size = (uint32_t)b.len;
+    free(b.data);
+    if (!ok && as->errors == before)
+        kasm_error(as, (SourceLoc){ as->path, st->line, st->column }, "invalid operand combination for '%s' in 16-bit mode", st->op);
+    return ok;
+}
+
 int kasm_estimate_statement(Assembler *as, Statement *st)
 {
     if (st->type != ST_INSTR)
         return 1;
+    if (as->bits == KASM_BITS_16)
+        return estimate16(as, st);
     const char *op = st->op;
     int c = st->operand_count;
     if (strcmp(op, "syscall") == 0 && c == 0) st->size = 15;
@@ -1173,9 +1934,15 @@ int kasm_encode_program(Assembler *as)
             sizes[st->section] = st->offset + st->size;
     }
     uint64_t file_align = tiny_direct ? 1 : 0x1000;
-    as->sections[SEC_TEXT].vaddr = 0x400000 + kasm_align(header, file_align);
-    as->sections[SEC_RODATA].vaddr = kasm_align(as->sections[SEC_TEXT].vaddr + sizes[SEC_TEXT], file_align);
-    as->sections[SEC_DATA].vaddr = kasm_align(as->sections[SEC_RODATA].vaddr + sizes[SEC_RODATA], file_align);
+    if (as->bits == KASM_BITS_16) {
+        as->sections[SEC_TEXT].vaddr = as->origin_set ? as->origin : 0;
+        as->sections[SEC_RODATA].vaddr = as->sections[SEC_TEXT].vaddr + sizes[SEC_TEXT];
+        as->sections[SEC_DATA].vaddr = as->sections[SEC_RODATA].vaddr + sizes[SEC_RODATA];
+    } else {
+        as->sections[SEC_TEXT].vaddr = 0x400000 + kasm_align(header, file_align);
+        as->sections[SEC_RODATA].vaddr = kasm_align(as->sections[SEC_TEXT].vaddr + sizes[SEC_TEXT], file_align);
+        as->sections[SEC_DATA].vaddr = kasm_align(as->sections[SEC_RODATA].vaddr + sizes[SEC_RODATA], file_align);
+    }
 
     for (size_t i = 0; i < as->program.len; i++) {
         Statement *st = &as->program.items[i];
@@ -1195,6 +1962,9 @@ int kasm_encode_program(Assembler *as)
                 if (!emit_data_once(as, st, b))
                     return 0;
             why = "data directive";
+        } else if (as->bits == KASM_BITS_16) {
+            if (!emit16(as, st, b, &why, 0))
+                return 0;
         } else if (!emit_instr(as, st, b, &why)) {
             return 0;
         }
@@ -1206,7 +1976,7 @@ int kasm_encode_program(Assembler *as)
                            "object output cannot encode requested operand within fixed instruction slot");
                 return 0;
             }
-            while (!as->tiny && b->len - before < st->size)
+            while (as->bits != KASM_BITS_16 && !as->tiny && b->len - before < st->size)
                 kasm_buf_append_u8(b, 0x90);
         }
     }

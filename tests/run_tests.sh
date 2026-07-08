@@ -31,7 +31,7 @@ expect_fail() {
     pass "$name"
 }
 
-./kasm --version | grep -q "KASM 0.1.0"
+./kasm --version | grep -q "KASM 0.2.1"
 ./kasm --help | grep -q -- "--dump-symbols"
 ./kasm --help | grep -q -- "--dump-all"
 ./kasm --help | grep -q -- "kasm inspect"
@@ -1007,6 +1007,195 @@ expect_fail "integer range" "$tmp/range.asm" "integer literal out of range"
 [ -s "$tmp/out.bin" ] || fail "raw bin"
 pass "raw bin"
 
+cat > "$tmp/bin16_bytes.asm" <<'ASM'
+bits 16
+org 0x7C00
+    mov ax, 0x1234
+    xor ax, ax
+    mov ds, ax
+    mov ax, ds
+    int 0x10
+    cli
+    sti
+    cld
+    hlt
+    mov ax, [bx + si]
+    mov ax, [bp]
+    mov ax, [0x1234]
+ASM
+./kasm "$tmp/bin16_bytes.asm" -f bin16 -o "$tmp/bin16_bytes.bin"
+od -An -tx1 "$tmp/bin16_bytes.bin" | tr -s ' \n' ' ' > "$tmp/bin16_bytes.hex"
+grep -q "b8 34 12 31 c0 8e d8 8c d8 cd 10 fa fb fc f4 8b 00 8b 46 00 8b 06 34 12" "$tmp/bin16_bytes.hex" || fail "bin16 encoder bytes"
+pass "bin16 encoder bytes"
+
+cat > "$tmp/boot_minimal.asm" <<'ASM'
+bits 16
+org 0x7C00
+
+start:
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+    sti
+    cld
+    mov si, message
+.print:
+    lodsb
+    test al, al
+    jz .halt
+    mov ah, 0x0E
+    mov bh, 0
+    int 0x10
+    jmp .print
+.halt:
+    cli
+    hlt
+    jmp .halt
+message:
+    db "Booted with KASM!", 13, 10, 0
+assert ($ - $$) <= 510, "boot sector exceeds 510 bytes"
+times 510 - ($ - $$) db 0
+dw 0xAA55
+ASM
+./kasm "$tmp/boot_minimal.asm" -f bin16 -o "$tmp/boot_minimal.bin"
+[ "$(wc -c < "$tmp/boot_minimal.bin" | tr -d ' ')" = "512" ] || fail "boot sector size"
+tail -c 2 "$tmp/boot_minimal.bin" | od -An -tx1 | grep -q "55 aa" || fail "boot sector signature"
+od -An -tx1 -N 4 "$tmp/boot_minimal.bin" | grep -q "fa 31 c0" || fail "boot sector instruction bytes"
+pass "bin16 boot sector"
+
+if command -v qemu-system-i386 >/dev/null 2>&1; then
+    set +e
+    timeout 3 qemu-system-i386 -drive format=raw,file="$tmp/boot_minimal.bin",if=floppy -display none -serial stdio -no-reboot -no-shutdown >/dev/null 2>&1
+    qemu_code=$?
+    set -e
+    [ "$qemu_code" -eq 124 ] || [ "$qemu_code" -eq 0 ] || fail "bin16 qemu boot"
+    pass "bin16 qemu boot"
+else
+    pass "bin16 qemu boot skipped"
+fi
+
+cat > "$tmp/com_hello.asm" <<'ASM'
+bits 16
+org 0x100
+start:
+    mov dx, message
+    mov ah, 0x09
+    int 0x21
+    mov ax, 0x4C00
+    int 0x21
+message:
+    db "Hello from a KASM-built COM program!$"
+ASM
+./kasm "$tmp/com_hello.asm" -f bin --bits 16 -o "$tmp/hello.com"
+[ -s "$tmp/hello.com" ] || fail "COM example"
+od -An -tx1 -N 8 "$tmp/hello.com" | grep -q "ba 0c 01 b4 09 cd 21" || fail "COM bytes"
+pass "bin16 COM"
+
+cat > "$tmp/bin16_bad.asm" <<'ASM'
+bits 16
+    mov rax, 1
+ASM
+if ./kasm "$tmp/bin16_bad.asm" -f bin16 -o "$tmp/bin16_bad.bin" 2> "$tmp/bin16_bad.err"; then
+    fail "bin16 bad register should fail"
+fi
+grep -q "unavailable in 16-bit mode" "$tmp/bin16_bad.err" || fail "bin16 bad register diagnostic"
+pass "bin16 diagnostics"
+
+if ./kasm "$tmp/bin16_bytes.asm" --bits 16 -f elf64 -o "$tmp/bad_elf" 2> "$tmp/bad_elf.err"; then
+    fail "bits16 elf64 should fail"
+fi
+grep -q "ELF64 output cannot be combined with --bits 16" "$tmp/bad_elf.err" || fail "bits16 elf64 diagnostic"
+pass "bin16 cli diagnostics"
+
+cat > "$tmp/bin16_dos_kernel_ops.asm" <<'ASM'
+bits 16
+org 0x1000
+start:
+    jmp 0x0000:0x7C00
+    call far 0x1234:0x5678
+    out 0xE9, al
+    in al, 0x60
+    out dx, ax
+    in ax, dx
+    lea di, [bp + 4]
+    les bx, [farptr]
+    lds si, [farptr]
+    xchg ax, bx
+    xchg cl, dh
+    add word [counter], 1
+    xor byte [flag], 0x80
+    cmp ax, [counter]
+    add [counter], ax
+    inc word [counter]
+    dec byte [flag]
+    not word [counter]
+farptr:
+    dw 0x0100, 0x2000
+counter:
+    dw 0
+flag:
+    db 0
+ASM
+./kasm "$tmp/bin16_dos_kernel_ops.asm" -f bin16 -o "$tmp/bin16_dos_kernel_ops.bin"
+od -An -tx1 "$tmp/bin16_dos_kernel_ops.bin" | tr -s ' \n' ' ' > "$tmp/bin16_dos_kernel_ops.hex"
+grep -q "ea 00 7c 00 00 9a 78 56 34 12 e6 e9 e4 60 ef ed 8d 7e 04 c4 1e" "$tmp/bin16_dos_kernel_ops.hex" || fail "bin16 DOS kernel op bytes"
+grep -q "c5 36 .* 93 86 ce 81 06 .* 01 00 80 36" "$tmp/bin16_dos_kernel_ops.hex" || fail "bin16 DOS memory op bytes"
+pass "bin16 DOS kernel ops"
+
+cat > "$tmp/doslike_kernel.asm" <<'ASM'
+bits 16
+org 0x1000
+
+start:
+    cli
+    xor ax, ax
+    mov es, ax
+    mov word [0x84], int21_handler
+    mov ax, cs
+    mov word [0x86], ax
+    sti
+    hlt
+
+int21_handler:
+    cmp ah, 0x09
+    jne .done
+    push ax
+    push bx
+    push si
+    mov si, dx
+.print:
+    mov al, [si]
+    cmp al, 0x24
+    je .pop
+    mov ah, 0x0E
+    mov bh, 0
+    int 0x10
+    inc si
+    jmp .print
+.pop:
+    pop si
+    pop bx
+    pop ax
+.done:
+    iret
+ASM
+./kasm "$tmp/doslike_kernel.asm" -f bin16 -o "$tmp/doslike_kernel.bin"
+od -An -tx1 "$tmp/doslike_kernel.bin" | tr -s ' \n' ' ' > "$tmp/doslike_kernel.hex"
+grep -q "fa 31 c0 8e c0 c7 06 84 00" "$tmp/doslike_kernel.hex" || fail "doslike IVT offset install"
+grep -q "8c c8 89 06 86 00" "$tmp/doslike_kernel.hex" || fail "doslike IVT segment install"
+grep -q "cf" "$tmp/doslike_kernel.hex" || fail "doslike iret"
+pass "bin16 DOS-like kernel skeleton"
+
+./kasm examples/doslike/int21_kernel.asm -f bin16 -o "$tmp/int21_kernel.bin"
+[ -s "$tmp/int21_kernel.bin" ] || fail "DOS-like example output"
+od -An -tx1 "$tmp/int21_kernel.bin" | tr -s ' \n' ' ' > "$tmp/int21_kernel.hex"
+grep -q "c7 06 84 00" "$tmp/int21_kernel.hex" || fail "DOS-like example IVT"
+grep -q "cf" "$tmp/int21_kernel.hex" || fail "DOS-like example IRET"
+pass "DOS-like example"
+
 for pair in "loop 0" "stack 42" "memory 42" "arithmetic 42"; do
     name=$(printf '%s' "$pair" | awk '{print $1}')
     expected=$(printf '%s' "$pair" | awk '{print $2}')
@@ -1225,7 +1414,7 @@ if ./kasm examples/hello.asm --explain-format json -o "$tmp/bad_explain_format" 
     fail "invalid explain format should fail"
 fi
 grep -q "unsupported explain format" "$tmp/bad_explain_format.err" || fail "invalid explain format diagnostic"
-grep -q "KASM 0.1.0 supports --explain-format text" "$tmp/bad_explain_format.err" || fail "invalid explain format hint"
+grep -q "KASM 0.2.1 supports --explain-format text" "$tmp/bad_explain_format.err" || fail "invalid explain format hint"
 pass "invalid explain format"
 
 ./kasm examples/stdlib_hello.asm -o "$tmp/stdlib_hello"
@@ -1431,7 +1620,7 @@ expect_fail "missing include" "$tmp/missing_include.asm" "include file not found
 grep -q "hint: add an -I path" "$tmp/missing include.err" || fail "missing include hint"
 
 cat > "$tmp/nasm_syntax.asm" <<'ASM'
-BITS 64
+default rel
 section .text
 _start:
     ret

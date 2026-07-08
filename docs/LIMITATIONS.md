@@ -1,6 +1,13 @@
 # Limitations
 
-KASM v1.4 is stable within a deliberately small scope.
+KASM 0.2.1 is stable within a deliberately small scope.
+
+The 16-bit mode is focused on 8086 real-mode raw binaries. It does not yet
+implement the full 8086 instruction matrix, indirect far transfers, ELF32, OMF,
+MZ EXE generation, 32-bit protected mode, floating point, MMX, SSE, or
+automatic jump relaxation. KASM can assemble small DOS-like kernels, monitors,
+and boot-time services, but it does not provide DOS filesystem, process, or MZ
+loader semantics.
 
 - not a full NASM/YASM/FASM/GAS replacement
 - Linux x86-64 only

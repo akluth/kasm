@@ -1,6 +1,6 @@
 CC ?= cc
 PREFIX ?= /usr/local
-VERSION = 0.1.0
+VERSION = 0.2.1
 
 WARN = -Wall -Wextra -Wpedantic -Werror
 CPPFLAGS ?= -Iinclude -DKASM_INSTALL_LIB=\"$(PREFIX)/share/kasm/lib\"

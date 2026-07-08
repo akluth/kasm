@@ -111,6 +111,18 @@ typedef enum {
     RELOC_64
 } RelocKind;
 
+typedef enum {
+    KASM_BITS_64 = 64,
+    KASM_BITS_16 = 16
+} KasmBits;
+
+typedef enum {
+    KASM_CPU_X86_64,
+    KASM_CPU_8086,
+    KASM_CPU_80186,
+    KASM_CPU_80286
+} KasmCpu;
+
 typedef struct {
     SectionId section;
     uint64_t offset;
@@ -155,6 +167,13 @@ typedef struct {
     int teach_level;
     int object_mode;
     int raw_mode;
+    KasmBits bits;
+    KasmCpu cpu;
+    int cli_bits;
+    int source_bits;
+    uint64_t origin;
+    int origin_set;
+    char *local_label_parent;
     int no_stdlib;
     int no_syscall_sugar;
     int print_include_paths;
